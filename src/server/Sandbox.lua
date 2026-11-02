@@ -880,6 +880,40 @@ local function buildEnv(player, state, runId)
 		GetPlayerFromCharacter = function(_, character)
 			return Players:GetPlayerFromCharacter(unwrap(character, state))
 		end,
+		-- Instance lookups the proxy was missing: without these,
+		-- the first thing most old scripts do,
+		-- Players:WaitForChild(name), is a call to nil. A lookup
+		-- that finds the executor returns the LocalPlayer proxy
+		-- (so GetMouse and Character keep working); any other
+		-- player comes back as the real Player, same as
+		-- GetPlayerByUserId already did.
+		WaitForChild = function(_, name, timeout)
+			local found
+			if timeout == nil then
+				found = Players:WaitForChild(name)
+			else
+				found = Players:WaitForChild(name, timeout)
+			end
+			if found == realPlayer then return localPlayerProxy end
+			return found
+		end,
+		FindFirstChild = function(_, name, recursive)
+			local found = Players:FindFirstChild(name, recursive)
+			if found == realPlayer then return localPlayerProxy end
+			return found
+		end,
+		FindFirstChildOfClass = function(_, className)
+			local found = Players:FindFirstChildOfClass(className)
+			if found == realPlayer then return localPlayerProxy end
+			return found
+		end,
+		FindFirstChildWhichIsA = function(_, className, recursive)
+			local found = Players:FindFirstChildWhichIsA(className, recursive)
+			if found == realPlayer then return localPlayerProxy end
+			return found
+		end,
+		GetChildren = function() return Players:GetChildren() end,
+		GetDescendants = function() return Players:GetDescendants() end,
 		PlayerAdded = Players.PlayerAdded,
 		PlayerRemoving = Players.PlayerRemoving,
 	}
