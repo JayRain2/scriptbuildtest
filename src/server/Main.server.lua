@@ -230,6 +230,60 @@ Players.PlayerRemoving:Connect(function(player)
 	end
 end)
 
+-- Parallel compile worker (v15.5): Ception's compile never
+-- yields, so compiling a big script on the main thread freezes
+-- the game even inside task.spawn. This worker runs under an
+-- Actor, so it compiles on a real worker thread: it requires
+-- Ception and the shared queue while still serial, then
+-- desynchronizes and answers compile requests from the queue.
+-- If anything here fails (Actor unsupported, files missing,
+-- worker never starts), Sandbox's compile step times out and
+-- falls back to main-thread compile, so a broken worker costs
+-- the freeze, never the run.
+local COMPILER_WORKER_SOURCE = [==[
+local svc = game:GetService("ServerScriptService")
+local vluau = svc:WaitForChild("vLuau", 10)
+if not vluau then error("ScriptBuilderCompiler: vLuau missing") end
+local ceptionMod = vluau:WaitForChild("Ception", 10)
+if not ceptionMod then error("ScriptBuilderCompiler: Ception missing") end
+local Ception = require(ceptionMod)
+local sharedMod = svc:WaitForChild("ScriptBuilderShared", 10)
+if not sharedMod then error("ScriptBuilderCompiler: ScriptBuilderShared missing") end
+local shared = require(sharedMod)
+task.desynchronize()
+while true do
+	task.wait(0.05)
+	if shared.reqBusy and not shared.resDone then
+		local ok, res = pcall(Ception.luau_compile, shared.reqSource)
+		if not ok then
+			shared.resKind = "workerError"
+			shared.resError = tostring(res)
+			shared.resBytecode = ""
+		elseif type(res) == "string" and res:sub(1, 1) == "\0" then
+			shared.resKind = "sourceError"
+			shared.resError = res:sub(2)
+			shared.resBytecode = ""
+		else
+			shared.resKind = "ok"
+			shared.resBytecode = res
+			shared.resError = ""
+		end
+		shared.resDone = true
+	end
+end
+]==]
+pcall(function()
+	local svc = game:GetService("ServerScriptService")
+	if svc:FindFirstChild("ScriptBuilderCompiler") then return end
+	local actor = Instance.new("Actor")
+	actor.Name = "ScriptBuilderCompiler"
+	local worker = Instance.new("Script")
+	worker.Name = "CompilerWorker"
+	worker.Source = COMPILER_WORKER_SOURCE
+	worker.Parent = actor
+	actor.Parent = svc
+end)
+
 -- Script size: any amount of text, bounded only against runaway
 -- uploads. The client pages the editor (500 lines / 50,000 chars
 -- per page, never more than that in any one Text property), and
