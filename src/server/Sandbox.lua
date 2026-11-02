@@ -508,7 +508,13 @@ local function reportRepair(state, text)
 	end
 end
 
--- The tracked Instance.new: allow-list, 1000 limit, script
+-- The tracked Instance.new: allow-list, script
+-- proxy parenting, asset watchers. There is deliberately no
+-- count limit here: scripts like The Angel create far more
+-- than 1000 instances over a run (blood puddles, effects, and
+-- so on), and killing the run at 1000 broke them. Clear Builds
+-- still destroys everything tracked, so that is the stop
+-- button if a script runs away.
 -- parenting, and asset watching. Used by user scripts (through
 -- the env) and by the repair code itself (follower MeshParts,
 -- SurfaceGuis), so repaired objects are also cleared by
@@ -524,9 +530,6 @@ createTrackedInstance = function(state, className, parent, allowBlocked)
 	if className == "Glue" then className = "Weld" end
 	if not allowBlocked and not ALLOWED_CLASSES[className] then
 		error("Instance.new(" .. className .. ") is not allowed in the sandbox", 0)
-	end
-	if #state.created >= 1000 then
-		error("Script hit the 1000 instance limit for one player (press Clear Builds to reset it)", 0)
 	end
 	local inst = Instance.new(className)
 	state.created[#state.created + 1] = inst
