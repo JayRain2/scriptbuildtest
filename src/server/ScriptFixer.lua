@@ -230,7 +230,7 @@ end
 -- right-hand side may span lines; wrapping it whole is still
 -- correct, because Lua only continues an expression past a
 -- newline inside brackets.
-local WRAP_PROPERTIES = { PlayerToHideFrom = true, Adornee = true }
+local WRAP_PROPERTIES = { PlayerToHideFrom = true, Adornee = true, Parent = true }
 
 local function wrapProxyAssignments(source)
 	local out = {}
@@ -239,6 +239,8 @@ local function wrapProxyAssignments(source)
 	local state = "code"
 	local quote = nil
 	local longLevel = 0
+	local braceDepth = 0
+	local prevSig = nil
 
 	local function append(s) out[#out + 1] = s end
 
@@ -323,6 +325,96 @@ local function wrapProxyAssignments(source)
 		return n + 1, rhs
 	end
 
+	-- Scans a table-field value starting at startPos. Returns
+	-- the index of its terminator (',' or '}' at the field's
+	-- brace depth) and the trimmed value, or nil if it is not
+	-- safe to wrap. Unlike scanRhs, newlines do not terminate
+	-- (a field value may start on the next line), line comments
+	-- are skipped, and ',' is the terminator, not an abort:
+	-- that is what separates a field from a multi-assign.
+	local function scanFieldRhs(startPos)
+		local depth = 0
+		local k = startPos
+		local inStr = nil
+		local inLong = false
+		local longLvl = 0
+		while k <= n do
+			local ch = source:sub(k, k)
+			local two = source:sub(k, k + 1)
+			if inStr then
+				if ch == "\\" then
+					k = k + 2
+				elseif ch == inStr then
+					inStr = nil
+					k = k + 1
+				elseif ch == "\n" then
+					return nil
+				else
+					k = k + 1
+				end
+			elseif inLong then
+				local closer = "]" .. string.rep("=", longLvl) .. "]"
+				if source:sub(k, k + #closer - 1) == closer then
+					inLong = false
+					k = k + #closer
+				else
+					k = k + 1
+				end
+			else
+				if two == "--" then
+					local level = source:sub(k + 2):match("^%[(=*)%[")
+					if level ~= nil then
+						local closer = "]" .. level .. "]"
+						local closeAt = source:find(closer, k + 4 + #level, true)
+						if not closeAt then return nil end
+						k = closeAt + #closer
+					else
+						local nl = source:find("\n", k, true)
+						if not nl then return nil end
+						k = nl + 1
+					end
+				elseif ch == '"' or ch == "'" then
+					inStr = ch
+					k = k + 1
+				elseif ch == "[" then
+					local level = source:sub(k):match("^%[(=*)%[")
+					if level ~= nil then
+						inLong = true
+						longLvl = #level
+						k = k + 2 + longLvl
+					else
+						depth = depth + 1
+						k = k + 1
+					end
+				elseif ch == "(" or ch == "{" then
+					depth = depth + 1
+					k = k + 1
+				elseif ch == ")" or ch == "]" then
+					depth = depth - 1
+					if depth < 0 then return nil end
+					k = k + 1
+				elseif ch == "}" then
+					if depth == 0 then
+						local rhs = source:sub(startPos, k - 1):gsub("%s+$", "")
+						if rhs == "" then return nil end
+						return k, rhs
+					end
+					depth = depth - 1
+					k = k + 1
+				elseif depth == 0 and ch == "," then
+					local rhs = source:sub(startPos, k - 1):gsub("%s+$", "")
+					if rhs == "" then return nil end
+					return k, rhs
+				elseif depth == 0 and ch == ";" then
+					return nil
+				else
+					k = k + 1
+				end
+			end
+		end
+		return nil
+	end
+
 	while i <= n do
 		local c = source:sub(i, i)
 		local two = source:sub(i, i + 1)
@@ -385,17 +477,77 @@ local function wrapProxyAssignments(source)
 						if source:sub(rhsEnd, rhsEnd + 1) == "--" then
 							append(" ")
 						end
+						prevSig = ")"
 						i = rhsEnd
 					else
 						append(c)
+						prevSig = "."
 						i = i + 1
 					end
 				else
 					append(c)
+					prevSig = "."
 					i = i + 1
+				end
+			elseif c:match("[%a_]") then
+				-- Table field: Parent / Adornee / PlayerToHideFrom
+				-- as a key inside {...}, e.g. the props tables
+				-- old Create helpers take: Create("Part")({
+				-- Parent = script, Name = "X" }). Only when the
+				-- previous significant character is '{' or ','
+				-- and we are inside braces: that rules out
+				-- `local Parent = ...` and bare `Parent = ...`
+				-- assignments, which must keep the proxy.
+				local word = source:sub(i):match("^[%a_][%w_]*")
+				local matchedField = nil
+				local eqEnd = nil
+				if word and WRAP_PROPERTIES[word] and braceDepth > 0
+					and (prevSig == "{" or prevSig == ",") then
+					local s, e = source:find("^" .. word .. "%s*=", i)
+					if s and source:sub(e + 1, e + 1) ~= "=" then
+						matchedField = word
+						eqEnd = e
+					end
+				end
+				if matchedField then
+					local j = eqEnd + 1
+					while j <= n do
+						local sp = source:sub(j, j)
+						if sp == " " or sp == "\t" or sp == "\r" or sp == "\n" then
+							j = j + 1
+						else
+							break
+						end
+					end
+					local rhsEnd, rhs = scanFieldRhs(j)
+					if rhsEnd and not rhs:find("^__sbUnwrap%(") then
+						append(source:sub(i, eqEnd))
+						append(" __sbUnwrap(")
+						append(rhs)
+						append(")")
+						prevSig = ")"
+						i = rhsEnd
+					else
+						append(word)
+						prevSig = word:sub(-1)
+						i = i + #word
+					end
+				else
+					append(word)
+					prevSig = word:sub(-1)
+					i = i + #word
 				end
 			else
 				append(c)
+				if c == "{" then
+					braceDepth = braceDepth + 1
+					prevSig = "{"
+				elseif c == "}" then
+					braceDepth = braceDepth - 1
+					prevSig = "}"
+				elseif c ~= " " and c ~= "\t" and c ~= "\r" and c ~= "\n" then
+					prevSig = c
+				end
 				i = i + 1
 			end
 		elseif state == "string" then
@@ -454,7 +606,7 @@ function Fixer.fix(source)
 	local wrapped = wrapProxyAssignments(fixed)
 	if wrapped ~= fixed then
 		fixed = wrapped
-		notes[#notes + 1] = "Sandbox proxy tables unwrapped for .PlayerToHideFrom / .Adornee (LocalPlayer and R15 characters are proxy tables; the engine needs real Instances there)."
+		notes[#notes + 1] = "Sandbox proxy tables unwrapped for .Parent / .PlayerToHideFrom / .Adornee, including table fields like {Parent = script} (LocalPlayer and R15 characters are proxy tables; the engine needs real Instances there)."
 	end
 
 	-- Hard blocks, reported as notes (the sandbox enforces them too).
