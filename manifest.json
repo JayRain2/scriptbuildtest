@@ -1,20 +1,25 @@
 {
-  "version": 1793654658,
+  "version": 1793659230,
   "files": [
     {
       "path": "src/server/Main.server.lua",
-      "sha256": "f4739e0826459a7bd5120bc416405032c400c6d9b0748a646da79a4406990666",
-      "size": 14760
+      "sha256": "bebea5512d76cd13af003b0db0da229a42e18668a4be291ef00753514e513cd2",
+      "size": 16816
     },
     {
       "path": "src/server/ScriptFixer.lua",
-      "sha256": "c3b20b7751bd8e61ffb665f6e2df343e63987bcbd299a6746ff53b98cb24fe5e",
-      "size": 18160
+      "sha256": "b8b770d9ef62e03980ce1df1974177e728ddcf9de18e8af5f9e830820c0ed4c7",
+      "size": 22460
     },
     {
       "path": "src/server/Sandbox.lua",
-      "sha256": "ee446c1945f37508f62f0e5c91cfd9ecfaedaafc7600ed236c9bfe9764c6222d",
-      "size": 51706
+      "sha256": "e9aa3f4e6851c864a8508ebcaf76c06cbc02658b0073be14c9dd5ebbf9bb2e8d",
+      "size": 55023
+    },
+    {
+      "path": "src/server/ScriptBuilderShared.lua",
+      "sha256": "2bd090096d519ac4f88b0162b75979a290f1dd418b5e70a526dc663f4cf49155",
+      "size": 931
     },
     {
       "path": "src/server/vLuau/init.lua",
