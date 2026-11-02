@@ -22,8 +22,12 @@
 -- with normal server-script power over THIS place (it can create
 -- parts, change Lighting, and so on - that is the point of a
 -- script builder), but it cannot read Main, Sandbox, or vLuau,
--- cannot create Script/LocalScript/ModuleScript/RemoteEvent/
--- RemoteFunction, and cannot reach the network or datastores.
+-- cannot create Script/ModuleScript objects with Instance.new,
+-- and cannot reach the network or datastores. Two deliberate
+-- exceptions, both needed by real FE-era scripts: RemoteEvent /
+-- RemoteFunction creation IS allowed (client code made by NLS
+-- needs remotes to talk to the server), and NLS(source, parent)
+-- creates a real LocalScript for client code (see env.NLS).
 --
 -- Conversion (the FE fix) still happens before compile, in
 -- ScriptFixer: LocalPlayer -> player, :connect -> :Connect,
@@ -47,6 +51,7 @@
 local Sandbox = {}
 
 local vLuau = require(script.Parent:WaitForChild("vLuau"))
+local ScriptFixer = require(script.Parent:WaitForChild("ScriptFixer"))
 local Players = game:GetService("Players")
 local AssetService = game:GetService("AssetService")
 local ContentProvider = game:GetService("ContentProvider")
@@ -67,6 +72,7 @@ for _, c in ipairs({
 	"Weld", "ManualWeld", "Motor6D", "Sky", "CharacterMesh",
 	"Shirt", "Pants", "BindableEvent", "Hat", "Accessory",
 	"ScreenGui", "ImageButton", "TextBox", "ScrollingFrame",
+	"RemoteEvent", "RemoteFunction",
 	"ViewportFrame", "CanvasGroup", "UIListLayout", "UIGridLayout",
 	"UIPadding", "UICorner", "UIStroke", "UIAspectRatioConstraint",
 	"Animation", "Tool", "Trail", "Highlight", "BodyColors",
@@ -88,7 +94,6 @@ for _, c in ipairs({
 
 local BLOCKED_CLASSES = {
 	Script = true, LocalScript = true, ModuleScript = true,
-	RemoteEvent = true, RemoteFunction = true,
 }
 
 --------------------------------------------------------------------------------
@@ -480,16 +485,16 @@ end
 -- the env) and by the repair code itself (follower MeshParts,
 -- SurfaceGuis), so repaired objects are also cleared by
 -- Clear Builds and counted against the same limit.
-createTrackedInstance = function(state, className, parent)
+createTrackedInstance = function(state, className, parent, allowBlocked)
 	if type(className) ~= "string" then
 		error("Instance.new expects a string class name", 0)
 	end
-	if BLOCKED_CLASSES[className] then
+	if not allowBlocked and BLOCKED_CLASSES[className] then
 		error("Instance.new(" .. className .. ") is not allowed in the sandbox", 0)
 	end
 	if className == "Motor" then className = "Motor6D" end
 	if className == "Glue" then className = "Weld" end
-	if not ALLOWED_CLASSES[className] then
+	if not allowBlocked and not ALLOWED_CLASSES[className] then
 		error("Instance.new(" .. className .. ") is not allowed in the sandbox", 0)
 	end
 	if #state.created >= 1000 then
@@ -1094,6 +1099,37 @@ local function buildEnv(player, state, runId)
 	env.script = scriptProxy
 	env.Instance = { new = instanceNew }
 	env.Content = Content
+	-- NLS: the old script-builder helper for client code.
+	-- NLS(source, parent) creates a real LocalScript from source,
+	-- parented to parent (default: the player's Backpack), and
+	-- returns it. The client runs it for real: a LocalScript
+	-- inside a Tool in Backpack, or in PlayerGui, Backpack, or
+	-- Character, executes on that player's client. The source
+	-- goes through the client-safe Fixer pass first (old method
+	-- spellings -> canonical), but NOT the server-side
+	-- conversions (LocalPlayer stays LocalPlayer on the client)
+	-- and NOT the proxy unwrap pass (the client has no
+	-- __sbUnwrap). The LocalScript is tracked like any other
+	-- created instance, so Clear Builds removes it.
+	env.NLS = function(source, parent)
+		if type(source) ~= "string" then
+			error("NLS expects a string of client code, got " .. type(source), 0)
+		end
+		if #source >= 200000 then
+			error("NLS source is " .. #source .. " chars, over the 200000-char Source limit for one script", 0)
+		end
+		local fixedClient = ScriptFixer.fixClientSource(source)
+		local targetParent
+		if parent == nil then
+			targetParent = player.Backpack
+		else
+			targetParent = unwrap(parent, state)
+		end
+		local ls = createTrackedInstance(state, "LocalScript", nil, true)
+		ls.Source = fixedClient
+		ls.Parent = targetParent
+		return ls
+	end
 	env.fixAsset = function(inst, property)
 		Sandbox.fixAsset(state, inst, property)
 	end
