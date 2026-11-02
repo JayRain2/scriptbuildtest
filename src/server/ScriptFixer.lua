@@ -19,6 +19,9 @@ local REPLACEMENTS = {
 	-- conversions that only make sense on the server; the client
 	-- pass (fixClientSource, used by NLS) skips those.
 	{ "game%.Players%.LocalPlayer", "player", "game.Players.LocalPlayer -> player (server-side owner)", "server" },
+	{ "game%.Players%.localPlayer", "player", "game.Players.localPlayer -> player (server-side owner)", "server" },
+	{ "game:GetService%(%s*\"Players\"%s*%)%.LocalPlayer", "player", 'game:GetService("Players").LocalPlayer -> player (server-side owner)', "server" },
+	{ "game:GetService%(%s*'Players'%s*%)%.LocalPlayer", "player", "game:GetService('Players').LocalPlayer -> player (server-side owner)", "server" },
 	{ "game%.Workspace", "workspace", "game.Workspace -> workspace", "server" },
 	{ "game:GetService%(%s*\"Workspace\"%s*%)", "workspace", 'game:GetService("Workspace") -> workspace', "server" },
 	{ "game:GetService%(%s*'Workspace'%s*%)", "workspace", "game:GetService('Workspace') -> workspace", "server" },
@@ -56,12 +59,16 @@ local REPLACEMENTS = {
 	{ ":applyimpulse%(", ":ApplyImpulse(", "Old :applyimpulse() -> :ApplyImpulse()" },
 	{ ":getpropertychangedsignal%(", ":GetPropertyChangedSignal(", "Old :getpropertychangedsignal() -> :GetPropertyChangedSignal()" },
 	{ ":findfirstdescendant%(", ":FindFirstDescendant(", "Old :findfirstdescendant() -> :FindFirstDescendant()" },
+	{ ":isA%(", ":IsA(", "Old :isA() -> :IsA()" },
+	{ ":lerp%(", ":Lerp(", "Old :lerp() -> :Lerp()" },
+	{ ":inverse%(", ":Inverse(", "Old :inverse() -> :Inverse()" },
 	{ ":getboundingbox%(", ":GetBoundingBox(", "Old :getboundingbox() -> :GetBoundingBox()" },
 	{ ":getmass%(", ":GetMass(", "Old :getmass() -> :GetMass()" },
 	{ ":getstate%(", ":GetState(", "Old :getstate() -> :GetState()" },
 	{ ":changestate%(", ":ChangeState(", "Old :changestate() -> :ChangeState()" },
 	{ ":setprimarypartcframe%(", ":SetPrimaryPartCFrame(", "Old :setprimarypartcframe() -> :SetPrimaryPartCFrame()" },
 	{ ":pivoto%(", ":PivotTo(", "Old :pivoto() -> :PivotTo()" },
+	{ ":pivotTo%(", ":PivotTo(", "Old :pivotTo() -> :PivotTo()" },
 	{ ":clearcharacterappearance%(", ":ClearCharacterAppearance(", "Old :clearcharacterappearance() -> :ClearCharacterAppearance()" },
 	{ ":isancestorof%(", ":IsAncestorOf(", "Old :isancestorof() -> :IsAncestorOf()" },
 	{ ":findpartsonraywithignorelist%(", ":FindPartsInRegion3WithIgnoreList(", "Old :findpartsonraywithignorelist() -> :FindPartsInRegion3WithIgnoreList()" },
@@ -84,6 +91,48 @@ local REPLACEMENTS = {
 	{ "%f[%w]delay%(", "task.delay(", "delay() -> task.delay()" },
 }
 
+-- Build a case-insensitive version of a Lua pattern, for
+-- method/property spellings only. Letters outside % escapes
+-- and [...] classes become [aA] classes; everything else
+-- (%, brackets, digits, punctuation) is copied verbatim.
+-- That closes the gap where the old interpreter's
+-- case-insensitive lookup let scripts use :waitForChild,
+-- :getchildren, :moveTo, :loadAnimation, etc., while the
+-- Fixer only rewrote one casing of each (e.g. :waitforchild
+-- but not :waitForChild, :getChildren but not :getchildren).
+-- Normalising to the canonical spelling is safe either way:
+-- canonical is always valid, so a script that already worked
+-- is unchanged in effect, and one that relied on
+-- case-insensitivity now gets the spelling real Luau wants.
+local function makeCaseInsensitive(pattern)
+	local out = {}
+	local i = 1
+	local n = #pattern
+	while i <= n do
+		local c = pattern:sub(i, i)
+		if c == "%" then
+			out[#out + 1] = pattern:sub(i, i + 1)
+			i = i + 2
+		elseif c == "[" then
+			local close = pattern:find("]", i, true)
+			if not close then
+				out[#out + 1] = c
+				i = i + 1
+			else
+				out[#out + 1] = pattern:sub(i, close)
+				i = close + 1
+			end
+		elseif c:match("[%a]") then
+			out[#out + 1] = "[" .. c:lower() .. c:upper() .. "]"
+			i = i + 1
+		else
+			out[#out + 1] = c
+			i = i + 1
+		end
+	end
+	return table.concat(out)
+end
+
 -- Replace only in code, never inside strings or comments.
 -- Scanner states: code, string (' or "), longstring, linecomment, blockcomment.
 local function replaceOutsideStringsAndComments(source, pattern, replacement)
@@ -93,6 +142,29 @@ local function replaceOutsideStringsAndComments(source, pattern, replacement)
 	local state = "code"
 	local quote = nil
 	local longLevel = 0
+	-- Method spellings and .formFactor are matched
+	-- case-insensitively (see makeCaseInsensitive); every
+	-- other pattern (game.*, wait/spawn/delay) stays exact.
+	-- Method calls and wait/spawn/delay are also matched
+	-- with optional spaces: Lua allows `v: remove ( )`,
+	-- `x:clone ( )` and `wait (1)`, and old scripts use
+	-- those spaced forms (Flash uses them throughout).
+	-- The spaces are consumed by the replacement, which is
+	-- fine: `:Connect(` means the same as `:Connect (`.
+	local searchPattern = pattern
+	if pattern:sub(1, 1) == ":" or pattern:find("formFactor", 1, true) then
+		searchPattern = makeCaseInsensitive(pattern)
+	end
+	if pattern:sub(1, 1) == ":" then
+		searchPattern = ":" .. "%s*" .. searchPattern:sub(2)
+	end
+	-- Every pattern ending in "%(" is a method or a
+	-- wait/spawn/delay call (game patterns end in "%)" or
+	-- have no paren, formFactor ends in "]"), so this only
+	-- affects those.
+	if searchPattern:sub(-2) == "%(" then
+		searchPattern = searchPattern:sub(1, -3) .. "%s*%("
+	end
 
 	while i <= n do
 		local c = source:sub(i, i)
@@ -133,7 +205,7 @@ local function replaceOutsideStringsAndComments(source, pattern, replacement)
 				local matched = false
 				for _, r in ipairs(REPLACEMENTS) do
 					if r[1] == pattern then
-						local s, e = source:find("^" .. pattern, i)
+						local s, e = source:find("^" .. searchPattern, i)
 						if s then
 							-- BUG FIX (was: task.wait -> task.task.wait):
 							-- %f[%w] only blocks a *word* character before
@@ -245,24 +317,309 @@ local function wrapProxyAssignments(source)
 	local function append(s) out[#out + 1] = s end
 
 	-- Scans a right-hand side starting at startPos. Returns
-	-- the index of its terminator (newline, ';', a line
-	-- comment, or a statement keyword such as end / else /
-	-- elseif / until at depth 0) and the trimmed right-hand
+	-- the index of its terminator and the trimmed right-hand
 	-- side, or nil if the right-hand side is not safe to wrap.
-	-- The keyword terminator is the Krystal Dance fix: a
-	-- one-line if like
-	--   if parent ~= nil then w.Parent = parent end
-	-- used to scan past the trailing `end`, because a newline
-	-- was the only terminator, and wrap it as
-	--   w.Parent = __sbUnwrap(parent end)
-	-- which the compiler then rejected as
-	-- "Expected ')' (to close '(' at column 44), got 'end'".
-	-- A keyword at depth 0, on a word boundary, ends the
-	-- right-hand side; the keyword itself is left for the
-	-- caller to emit unchanged.
+	-- Terminators at depth 0: newline, ';', a line comment,
+	-- a statement keyword (end / else / elseif / until, and
+	-- any statement-starting word after a complete operand),
+	-- or the start of a new statement after a complete
+	-- operand. The last rule is the Flash-script fix: Lua
+	-- does not require a separator between statements, so
+	-- old one-line chains like
+	--   fake.head.Parent = model fake.head.BrickColor = ...
+	-- used to scan past `model` and wrap it as
+	--   __sbUnwrap(model fake.head.BrickColor = ...)
+	-- which the compiler rejected with "')' expected near
+	-- 'fake'". The scanner now tracks whether the previous
+	-- token completed an operand: after an operand, a word
+	-- (other than and/or) or a number starts a new
+	-- statement, so the right-hand side ends before it.
+	-- Operators, suffixes (.name, [i], :m(), (args)) and
+	-- call arguments in string/table form keep the operand
+	-- open, so `x.Parent = foo(a, b)`, `x.Parent = a + b`,
+	-- `x.Parent = foo "bar"` and `x.Parent = a.Parent`
+	-- still wrap whole. The Krystal keyword rule is a
+	-- special case of this: a keyword at depth 0, on a
+	-- word boundary, ends the right-hand side; the keyword
+	-- itself is left for the caller to emit unchanged.
 	local function scanRhs(startPos)
 		local depth = 0
 		local blockDepth = 0
+		local prevOperandEnd = false
+		local started = false
+		local awaitingLoopDo = false
+		local k = startPos
+		local inStr = nil
+		local inLong = false
+		local longLvl = 0
+		while k <= n do
+			local ch = source:sub(k, k)
+			local two = source:sub(k, k + 1)
+			if inStr then
+				if ch == "\\" then
+					k = k + 2
+				elseif ch == inStr then
+					inStr = nil
+					prevOperandEnd = true
+					k = k + 1
+				elseif ch == "\n" then
+					return nil
+				else
+					k = k + 1
+				end
+			elseif inLong then
+				local closer = "]" .. string.rep("=", longLvl) .. "]"
+				if source:sub(k, k + #closer - 1) == closer then
+					inLong = false
+					prevOperandEnd = true
+					k = k + #closer
+				else
+					k = k + 1
+				end
+			else
+				if depth == 0 then
+					local prev = source:sub(k - 1, k - 1)
+					local atWordStart = prev == "" or not prev:match("[%w_]")
+					if atWordStart then
+						local word = source:sub(k):match("^[%a_][%w_]*")
+						if word then
+							started = true
+							-- A complete operand followed by
+							-- a word that is not a binary
+							-- operator: that word starts a
+							-- new statement (an assignment,
+							-- a call, local, if, for, while,
+							-- repeat, do, return, break, a
+							-- function statement, ...).
+							if blockDepth == 0 and prevOperandEnd
+								and word ~= "and" and word ~= "or" then
+								local rhs = source:sub(startPos, k - 1):gsub("%s+$", "")
+								if rhs == "" then return nil end
+								return k, rhs
+							end
+							local handledWord = false
+							-- `do`: a loop's `do` (for/while)
+							-- is part of that loop's block,
+							-- not a new block; a standalone
+							-- `do` is a block of its own.
+							-- awaitingLoopDo tracks a for/while
+							-- whose `do` has not been seen
+							-- yet, so `function() do x() end
+							-- end` counts both blocks while
+							-- `for i=1,10 do x() end` counts
+							-- one. (Only reached when no
+							-- operand just ended, as above.)
+							if word == "do" then
+								local after = source:sub(k + 2, k + 2)
+								if after == "" or not after:match("[%w_]") then
+									if awaitingLoopDo then
+										awaitingLoopDo = false
+									else
+										blockDepth = blockDepth + 1
+									end
+									prevOperandEnd = false
+									handledWord = true
+								end
+							end
+							-- Block openers inside a right-hand
+							-- side (only realistic case: a
+							-- function literal as the value)
+							-- open a block whose own `end`
+							-- must not terminate the scan.
+							-- (Only reached when no operand
+							-- just ended, because the check
+							-- above already returned for a
+							-- word after an operand.)
+							if not handledWord then
+							for _, kw in ipairs({ "function", "if", "for", "while", "repeat" }) do
+								if source:sub(k, k + #kw - 1) == kw then
+									local after = source:sub(k + #kw, k + #kw)
+									if after == "" or not after:match("[%w_]") then
+										blockDepth = blockDepth + 1
+										if kw == "for" or kw == "while" then
+											awaitingLoopDo = true
+										end
+										prevOperandEnd = false
+										handledWord = true
+										break
+									end
+								end
+							end
+							end
+							if not handledWord then
+								for _, kw in ipairs({ "elseif", "else", "end", "until" }) do
+									if source:sub(k, k + #kw - 1) == kw then
+										local after = source:sub(k + #kw, k + #kw)
+										if after == "" or not after:match("[%w_]") then
+											if blockDepth > 0 then
+												if kw == "end" or kw == "until" then
+													blockDepth = blockDepth - 1
+													prevOperandEnd = blockDepth == 0
+												else
+													prevOperandEnd = false
+												end
+												-- else/elseif belong to
+												-- the inner block: keep
+												-- scanning, do not end here.
+											else
+												local rhs = source:sub(startPos, k - 1):gsub("%s+$", "")
+												if rhs == "" then return nil end
+												return k, rhs
+											end
+											handledWord = true
+										end
+									end
+								end
+							end
+							if not handledWord then
+								if word == "and" or word == "or" or word == "not" then
+									prevOperandEnd = false
+								else
+									prevOperandEnd = true
+								end
+							end
+						end
+					end
+				end
+				if two == "--" then
+					if blockDepth > 0 then
+						-- Inside a function literal, a comment
+						-- is not a terminator: skip it and keep
+						-- scanning the function body.
+						local level = source:sub(k + 2):match("^%[(=*)%[")
+						if level ~= nil then
+							local closer = "]" .. level .. "]"
+							local closeAt = source:find(closer, k + 4 + #level, true)
+							if not closeAt then return nil end
+							k = closeAt + #closer
+						else
+							local nl = source:find("\n", k, true)
+							if not nl then return nil end
+							k = nl + 1
+						end
+					elseif depth == 0 then
+						local rhs = source:sub(startPos, k - 1):gsub("%s+$", "")
+						if rhs == "" then return nil end
+						return k, rhs
+					else
+						return nil
+					end
+				elseif ch == '"' or ch == "'" then
+					inStr = ch
+					started = true
+					prevOperandEnd = false
+					k = k + 1
+				elseif ch == "[" then
+					local level = source:sub(k):match("^%[(=*)%[")
+					if level ~= nil then
+						inLong = true
+						longLvl = #level
+						started = true
+						prevOperandEnd = false
+						k = k + 2 + longLvl
+					else
+						depth = depth + 1
+						started = true
+						prevOperandEnd = false
+						k = k + 1
+					end
+				elseif ch == "(" or ch == "{" then
+					depth = depth + 1
+					started = true
+					prevOperandEnd = false
+					k = k + 1
+				elseif ch == ")" or ch == "]" or ch == "}" then
+					depth = depth - 1
+					if depth < 0 then return nil end
+					started = true
+					prevOperandEnd = true
+					k = k + 1
+				elseif depth == 0 and blockDepth == 0 and ch:match("%d") and prevOperandEnd
+					and not source:sub(k - 1, k - 1):match("[%w_.]") then
+					-- A number starting a new statement after
+					-- a complete operand (a bare number is not
+					-- a call argument, unlike a string or a
+					-- table, so it cannot continue the RHS).
+					local rhs = source:sub(startPos, k - 1):gsub("%s+$", "")
+					if rhs == "" then return nil end
+					return k, rhs
+				elseif ch:match("[%+%-%*/%%^<>~=#%.:]") then
+					-- Binary/unary operator, field/index/method
+					-- suffix, or '.'/'..': the operand is not
+					-- complete yet, the next token continues it.
+					started = true
+					prevOperandEnd = false
+					k = k + 1
+				elseif ch:match("%d") then
+					started = true
+					prevOperandEnd = true
+					k = k + 1
+				elseif depth == 0 and ch == "\n" then
+					-- A newline ends the RHS, except inside
+					-- a function literal (where it only
+					-- separates statements), before any
+					-- token (RHS starting on the next line
+					-- is not wrapped, as before), or after
+					-- an operator/dot (Lua continues an
+					-- expression after a trailing operator,
+					-- so `w.Parent = a or\n b` wraps whole).
+					if blockDepth > 0 then
+						k = k + 1
+					elseif not started then
+						return nil
+					elseif prevOperandEnd then
+						local rhs = source:sub(startPos, k - 1):gsub("%s+$", "")
+						if rhs == "" then return nil end
+						return k, rhs
+					else
+						k = k + 1
+					end
+				elseif depth == 0 and ch == ";" then
+					if blockDepth > 0 then
+						k = k + 1
+					else
+						local rhs = source:sub(startPos, k - 1):gsub("%s+$", "")
+						if rhs == "" then return nil end
+						return k, rhs
+					end
+				elseif depth == 0 and ch == "," then
+					if blockDepth > 0 then
+						k = k + 1
+					else
+						return nil
+					end
+				else
+					k = k + 1
+				end
+			end
+		end
+		if depth ~= 0 or inStr or inLong then return nil end
+		local rhs = source:sub(startPos, n):gsub("%s+$", "")
+		if rhs == "" then return nil end
+		return n + 1, rhs
+	end
+
+	-- Scans a table-field value starting at startPos. Returns
+	-- the index of its terminator (',' or '}' at the field's
+	-- brace depth, ';' as a field separator, or a line
+	-- comment before the separator) and the trimmed value,
+	-- or nil if it is not safe to wrap. Unlike scanRhs,
+	-- newlines do not terminate (a field value may start
+	-- on the next line), and ',' is the terminator, not an
+	-- abort: that is what separates a field from a
+	-- multi-assign. Block tracking mirrors scanRhs: a comma
+	-- (or semicolon) inside a function literal's body does
+	-- not terminate the field, so
+	--   {Parent = function() local a, b = 1, 2 return a end, ...}
+	-- wraps whole instead of closing at the body's comma.
+	-- A line comment before the separator terminates the
+	-- field (the wrapper's ')' must land before the
+	-- comment, not on the comment line where it would be
+	-- commented out); block comments are skipped as before.
+	local function scanFieldRhs(startPos)
+		local depth = 0
+		local blockDepth = 0
+		local awaitingLoopDo = false
 		local k = startPos
 		local inStr = nil
 		local inLong = false
@@ -294,34 +651,31 @@ local function wrapProxyAssignments(source)
 					local prev = source:sub(k - 1, k - 1)
 					local atWordStart = prev == "" or not prev:match("[%w_]")
 					if atWordStart then
-						-- Block openers inside a right-hand side
-						-- (only realistic case: a function literal
-						-- as the value) open a block whose own
-						-- `end` must not terminate the scan.
-						for _, kw in ipairs({ "function", "if", "for", "while", "repeat" }) do
-							if source:sub(k, k + #kw - 1) == kw then
-								local after = source:sub(k + #kw, k + #kw)
+						local word = source:sub(k):match("^[%a_][%w_]*")
+						if word then
+							if word == "do" then
+								local after = source:sub(k + 2, k + 2)
 								if after == "" or not after:match("[%w_]") then
-									blockDepth = blockDepth + 1
-									break
-								end
-							end
-						end
-						for _, kw in ipairs({ "elseif", "else", "end", "until" }) do
-							if source:sub(k, k + #kw - 1) == kw then
-								local after = source:sub(k + #kw, k + #kw)
-								if after == "" or not after:match("[%w_]") then
-									if blockDepth > 0 then
-										if kw == "end" or kw == "until" then
-											blockDepth = blockDepth - 1
-										end
-										-- else/elseif belong to
-										-- the inner block: keep
-										-- scanning, do not end here.
+									if awaitingLoopDo then
+										awaitingLoopDo = false
 									else
-										local rhs = source:sub(startPos, k - 1):gsub("%s+$", "")
-										if rhs == "" then return nil end
-										return k, rhs
+										blockDepth = blockDepth + 1
+									end
+								end
+							else
+								for _, kw in ipairs({ "function", "if", "for", "while", "repeat" }) do
+									if word == kw then
+										blockDepth = blockDepth + 1
+										if kw == "for" or kw == "while" then
+											awaitingLoopDo = true
+										end
+										break
+									end
+								end
+								for _, kw in ipairs({ "end", "until" }) do
+									if word == kw and blockDepth > 0 then
+										blockDepth = blockDepth - 1
+										break
 									end
 								end
 							end
@@ -329,92 +683,12 @@ local function wrapProxyAssignments(source)
 					end
 				end
 				if two == "--" then
-					if depth == 0 then
+					local level = source:sub(k + 2):match("^%[(=*)%[")
+					if level == nil and depth == 0 and blockDepth == 0 then
 						local rhs = source:sub(startPos, k - 1):gsub("%s+$", "")
 						if rhs == "" then return nil end
 						return k, rhs
-					end
-					return nil
-				elseif ch == '"' or ch == "'" then
-					inStr = ch
-					k = k + 1
-				elseif ch == "[" then
-					local level = source:sub(k):match("^%[(=*)%[")
-					if level ~= nil then
-						inLong = true
-						longLvl = #level
-						k = k + 2 + longLvl
-					else
-						depth = depth + 1
-						k = k + 1
-					end
-				elseif ch == "(" or ch == "{" then
-					depth = depth + 1
-					k = k + 1
-				elseif ch == ")" or ch == "]" or ch == "}" then
-					depth = depth - 1
-					if depth < 0 then return nil end
-					k = k + 1
-				elseif depth == 0 and ch == "\n" then
-					local rhs = source:sub(startPos, k - 1):gsub("%s+$", "")
-					if rhs == "" then return nil end
-					return k, rhs
-				elseif depth == 0 and ch == ";" then
-					local rhs = source:sub(startPos, k - 1):gsub("%s+$", "")
-					if rhs == "" then return nil end
-					return k, rhs
-				elseif depth == 0 and ch == "," then
-					return nil
-				else
-					k = k + 1
-				end
-			end
-		end
-		if depth ~= 0 or inStr or inLong then return nil end
-		local rhs = source:sub(startPos, n):gsub("%s+$", "")
-		if rhs == "" then return nil end
-		return n + 1, rhs
-	end
-
-	-- Scans a table-field value starting at startPos. Returns
-	-- the index of its terminator (',' or '}' at the field's
-	-- brace depth) and the trimmed value, or nil if it is not
-	-- safe to wrap. Unlike scanRhs, newlines do not terminate
-	-- (a field value may start on the next line), line comments
-	-- are skipped, and ',' is the terminator, not an abort:
-	-- that is what separates a field from a multi-assign.
-	local function scanFieldRhs(startPos)
-		local depth = 0
-		local k = startPos
-		local inStr = nil
-		local inLong = false
-		local longLvl = 0
-		while k <= n do
-			local ch = source:sub(k, k)
-			local two = source:sub(k, k + 1)
-			if inStr then
-				if ch == "\\" then
-					k = k + 2
-				elseif ch == inStr then
-					inStr = nil
-					k = k + 1
-				elseif ch == "\n" then
-					return nil
-				else
-					k = k + 1
-				end
-			elseif inLong then
-				local closer = "]" .. string.rep("=", longLvl) .. "]"
-				if source:sub(k, k + #closer - 1) == closer then
-					inLong = false
-					k = k + #closer
-				else
-					k = k + 1
-				end
-			else
-				if two == "--" then
-					local level = source:sub(k + 2):match("^%[(=*)%[")
-					if level ~= nil then
+					elseif level ~= nil then
 						local closer = "]" .. level .. "]"
 						local closeAt = source:find(closer, k + 4 + #level, true)
 						if not closeAt then return nil end
@@ -453,11 +727,24 @@ local function wrapProxyAssignments(source)
 					depth = depth - 1
 					k = k + 1
 				elseif depth == 0 and ch == "," then
-					local rhs = source:sub(startPos, k - 1):gsub("%s+$", "")
-					if rhs == "" then return nil end
-					return k, rhs
+					if blockDepth > 0 then
+						k = k + 1
+					else
+						local rhs = source:sub(startPos, k - 1):gsub("%s+$", "")
+						if rhs == "" then return nil end
+						return k, rhs
+					end
 				elseif depth == 0 and ch == ";" then
-					return nil
+					-- ';' is a valid table field separator in
+					-- Lua, so it terminates the field just
+					-- like ',' (it used to abort the wrap).
+					if blockDepth > 0 then
+						k = k + 1
+					else
+						local rhs = source:sub(startPos, k - 1):gsub("%s+$", "")
+						if rhs == "" then return nil end
+						return k, rhs
+					end
 				else
 					k = k + 1
 				end
@@ -525,7 +812,7 @@ local function wrapProxyAssignments(source)
 						append(" __sbUnwrap(")
 						append(rhs)
 						append(")")
-						if source:sub(rhsEnd, rhsEnd + 1) == "--" or source:sub(rhsEnd, rhsEnd):match("[%a_]") then
+						if source:sub(rhsEnd, rhsEnd + 1) == "--" or source:sub(rhsEnd, rhsEnd):match("[%w]") then
 							append(" ")
 						end
 						prevSig = ")"
@@ -545,15 +832,16 @@ local function wrapProxyAssignments(source)
 				-- as a key inside {...}, e.g. the props tables
 				-- old Create helpers take: Create("Part")({
 				-- Parent = script, Name = "X" }). Only when the
-				-- previous significant character is '{' or ','
-				-- and we are inside braces: that rules out
-				-- `local Parent = ...` and bare `Parent = ...`
+				-- previous significant character is '{', ',' or
+				-- ';' (Lua allows ';' as a table field
+				-- separator) and we are inside braces: that rules
+				-- out `local Parent = ...` and bare `Parent = ...`
 				-- assignments, which must keep the proxy.
 				local word = source:sub(i):match("^[%a_][%w_]*")
 				local matchedField = nil
 				local eqEnd = nil
 				if word and WRAP_PROPERTIES[word] and braceDepth > 0
-					and (prevSig == "{" or prevSig == ",") then
+					and (prevSig == "{" or prevSig == "," or prevSig == ";") then
 					local s, e = source:find("^" .. word .. "%s*=", i)
 					if s and source:sub(e + 1, e + 1) ~= "=" then
 						matchedField = word
@@ -576,6 +864,9 @@ local function wrapProxyAssignments(source)
 						append(" __sbUnwrap(")
 						append(rhs)
 						append(")")
+						if source:sub(rhsEnd, rhsEnd + 1) == "--" then
+							append(" ")
+						end
 						prevSig = ")"
 						i = rhsEnd
 					else
