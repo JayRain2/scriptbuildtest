@@ -1,5 +1,5 @@
 {
-  "version": 1793652540,
+  "version": 1793653195,
   "files": [
     {
       "path": "src/server/Main.server.lua",
@@ -13,8 +13,8 @@
     },
     {
       "path": "src/server/Sandbox.lua",
-      "sha256": "5dfa242e21b94a40a6f12e2c92ac2804622584804d062d7820b1671207fe9822",
-      "size": 49146
+      "sha256": "1e262380f5d2b33366032bdf48d824d05021b9809ed08c307e5fb3e2c5313c42",
+      "size": 50279
     },
     {
       "path": "src/server/vLuau/init.lua",
