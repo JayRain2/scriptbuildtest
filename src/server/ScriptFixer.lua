@@ -15,11 +15,13 @@
 local Fixer = {}
 
 local REPLACEMENTS = {
-	-- {pattern, replacement, note}
-	{ "game%.Players%.LocalPlayer", "player", "game.Players.LocalPlayer -> player (server-side owner)" },
-	{ "game%.Workspace", "workspace", "game.Workspace -> workspace" },
-	{ "game:GetService%(%s*\"Workspace\"%s*%)", "workspace", 'game:GetService("Workspace") -> workspace' },
-	{ "game:GetService%(%s*'Workspace'%s*%)", "workspace", "game:GetService('Workspace') -> workspace" },
+	-- {pattern, replacement, note, scope} scope is "server" for
+	-- conversions that only make sense on the server; the client
+	-- pass (fixClientSource, used by NLS) skips those.
+	{ "game%.Players%.LocalPlayer", "player", "game.Players.LocalPlayer -> player (server-side owner)", "server" },
+	{ "game%.Workspace", "workspace", "game.Workspace -> workspace", "server" },
+	{ "game:GetService%(%s*\"Workspace\"%s*%)", "workspace", 'game:GetService("Workspace") -> workspace', "server" },
+	{ "game:GetService%(%s*'Workspace'%s*%)", "workspace", "game:GetService('Workspace') -> workspace", "server" },
 	{ ":connect%(", ":Connect(", "Old lowercase :connect() -> :Connect()" },
 	{ ":disconnect%(", ":Disconnect(", "Old lowercase :disconnect() -> :Disconnect()" },
 	-- Old method spellings -> canonical ones. With a real Luau
@@ -457,10 +459,34 @@ function Fixer.fix(source)
 
 	-- Hard blocks, reported as notes (the sandbox enforces them too).
 	if fixed:find("Instance%.new%(%s*[\"']Script[\"']") or fixed:find("Instance%.new%(%s*[\"']LocalScript[\"']") then
-		notes[#notes + 1] = "Creating Script/LocalScript objects is blocked by the sandbox."
+		notes[#notes + 1] = "Creating Script/LocalScript objects with Instance.new is blocked by the sandbox; use NLS(source, parent) for client code."
 	end
 	notes[#notes + 1] = "Runs on the server through vLuau (a real Luau compiler + VM), not the client: every Part/Model it creates replicates normally under FilteringEnabled."
 	notes[#notes + 1] = "script.Parent points at your per-player build folder. game.Players.LocalPlayer is the player who pressed Execute."
+
+	return fixed, notes
+end
+
+-- Client-side pass, used by NLS. Applies only the rewrites that
+-- are safe on a real client: old method spellings, .formFactor,
+-- and wait/spawn/delay -> task.*. It deliberately does NOT apply
+-- the server-side conversions (game.Players.LocalPlayer ->
+-- player, game.Workspace -> workspace), because on the client
+-- LocalPlayer is valid and `player` is undefined. It also does
+-- NOT apply the proxy unwrap pass: the client has no __sbUnwrap.
+function Fixer.fixClientSource(source)
+	local notes = {}
+	local fixed = source
+
+	for _, r in ipairs(REPLACEMENTS) do
+		if r[4] ~= "server" then
+			local before = fixed
+			fixed = replaceOutsideStringsAndComments(fixed, r[1], r[2])
+			if fixed ~= before then
+				notes[#notes + 1] = r[3]
+			end
+		end
+	end
 
 	return fixed, notes
 end
