@@ -245,11 +245,24 @@ local function wrapProxyAssignments(source)
 	local function append(s) out[#out + 1] = s end
 
 	-- Scans a right-hand side starting at startPos. Returns
-	-- the index of its terminator (newline, ';', or a line
-	-- comment) and the trimmed right-hand side, or nil if the
-	-- right-hand side is not safe to wrap.
+	-- the index of its terminator (newline, ';', a line
+	-- comment, or a statement keyword such as end / else /
+	-- elseif / until at depth 0) and the trimmed right-hand
+	-- side, or nil if the right-hand side is not safe to wrap.
+	-- The keyword terminator is the Krystal Dance fix: a
+	-- one-line if like
+	--   if parent ~= nil then w.Parent = parent end
+	-- used to scan past the trailing `end`, because a newline
+	-- was the only terminator, and wrap it as
+	--   w.Parent = __sbUnwrap(parent end)
+	-- which the compiler then rejected as
+	-- "Expected ')' (to close '(' at column 44), got 'end'".
+	-- A keyword at depth 0, on a word boundary, ends the
+	-- right-hand side; the keyword itself is left for the
+	-- caller to emit unchanged.
 	local function scanRhs(startPos)
 		local depth = 0
+		local blockDepth = 0
 		local k = startPos
 		local inStr = nil
 		local inLong = false
@@ -277,6 +290,44 @@ local function wrapProxyAssignments(source)
 					k = k + 1
 				end
 			else
+				if depth == 0 then
+					local prev = source:sub(k - 1, k - 1)
+					local atWordStart = prev == "" or not prev:match("[%w_]")
+					if atWordStart then
+						-- Block openers inside a right-hand side
+						-- (only realistic case: a function literal
+						-- as the value) open a block whose own
+						-- `end` must not terminate the scan.
+						for _, kw in ipairs({ "function", "if", "for", "while", "repeat" }) do
+							if source:sub(k, k + #kw - 1) == kw then
+								local after = source:sub(k + #kw, k + #kw)
+								if after == "" or not after:match("[%w_]") then
+									blockDepth = blockDepth + 1
+									break
+								end
+							end
+						end
+						for _, kw in ipairs({ "elseif", "else", "end", "until" }) do
+							if source:sub(k, k + #kw - 1) == kw then
+								local after = source:sub(k + #kw, k + #kw)
+								if after == "" or not after:match("[%w_]") then
+									if blockDepth > 0 then
+										if kw == "end" or kw == "until" then
+											blockDepth = blockDepth - 1
+										end
+										-- else/elseif belong to
+										-- the inner block: keep
+										-- scanning, do not end here.
+									else
+										local rhs = source:sub(startPos, k - 1):gsub("%s+$", "")
+										if rhs == "" then return nil end
+										return k, rhs
+									end
+								end
+							end
+						end
+					end
+				end
 				if two == "--" then
 					if depth == 0 then
 						local rhs = source:sub(startPos, k - 1):gsub("%s+$", "")
@@ -474,7 +525,7 @@ local function wrapProxyAssignments(source)
 						append(" __sbUnwrap(")
 						append(rhs)
 						append(")")
-						if source:sub(rhsEnd, rhsEnd + 1) == "--" then
+						if source:sub(rhsEnd, rhsEnd + 1) == "--" or source:sub(rhsEnd, rhsEnd):match("[%a_]") then
 							append(" ")
 						end
 						prevSig = ")"
