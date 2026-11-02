@@ -145,8 +145,13 @@ local function clearPlayerBuilds(player)
 		state.casBindings = {}
 	end
 	for _, inst in ipairs(state.created) do
-		if inst and inst.Parent ~= nil then
-			count = count + 1
+		if inst then
+			if inst.Parent ~= nil then count = count + 1 end
+			-- Destroy even parentless tracked instances: the
+			-- Heartbeat relay is parentless, and Clear Builds
+			-- must destroy it so the handlers connected to it
+			-- die with it. Destroying an already-destroyed
+			-- instance is a safe no-op under pcall.
 			pcall(function() inst:Destroy() end)
 		end
 	end
