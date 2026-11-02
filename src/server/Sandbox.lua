@@ -518,7 +518,8 @@ end
 -- parenting, and asset watching. Used by user scripts (through
 -- the env) and by the repair code itself (follower MeshParts,
 -- SurfaceGuis), so repaired objects are also cleared by
--- Clear Builds and counted against the same limit.
+-- Clear Builds. The Heartbeat relay is built on this too: it is
+-- a tracked parentless BindableEvent, and Clear destroys it.
 createTrackedInstance = function(state, className, parent, allowBlocked)
 	if type(className) ~= "string" then
 		error("Instance.new expects a string class name", 0)
@@ -872,15 +873,37 @@ local function buildEnv(player, state, runId)
 	state.proxyReal[localPlayerProxy] = realPlayer
 
 	local runService = game:GetService("RunService")
+
+	-- Heartbeat relay (v15.4): user scripts used to connect
+	-- straight to Roblox's real Heartbeat signal, which nothing
+	-- in the sandbox tracked. Clear Builds destroyed the
+	-- script's instances but left its Heartbeat handler
+	-- connected, so a previous script's loop kept firing every
+	-- frame -- and once its script.Heartbeat event had been
+	-- destroyed by the Clear, that loop errored "attempt to
+	-- index nil with 'Fire'" forever (Fiu:894 is the NAMECALL
+	-- fallback, so a nil:Fire() lands there). The relay fixes
+	-- it: scripts connect to a BindableEvent the builder owns
+	-- (tracked, so Clear destroys it, which disconnects
+	-- everything connected to it), and the real Heartbeat just
+	-- forwards its delta into the relay. The pcall is for the
+	-- race where a Heartbeat fire is already in flight while
+	-- Clear destroys the relay.
+	local heartbeatRelay = createTrackedInstance(state, "BindableEvent", nil)
+	state.connections = state.connections or {}
+	local heartbeatRelayConn = runService.Heartbeat:Connect(function(dt)
+		pcall(function() heartbeatRelay:Fire(dt) end)
+	end)
+	state.connections[#state.connections + 1] = heartbeatRelayConn
 	local runServiceProxy = {
-		Heartbeat = runService.Heartbeat,
-		Stepped = runService.Heartbeat,
-		RenderStepped = runService.Heartbeat,
+		Heartbeat = heartbeatRelay.Event,
+		Stepped = heartbeatRelay.Event,
+		RenderStepped = heartbeatRelay.Event,
 		IsStudio = function() return runService:IsStudio() end,
 		IsServer = function() return true end,
 		IsClient = function() return false end,
 		BindToRenderStep = function(_, name, priority, fn)
-			return runService.Heartbeat:Connect(fn)
+			return heartbeatRelay.Event:Connect(fn)
 		end,
 		UnbindFromRenderStep = function() end,
 	}
