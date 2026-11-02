@@ -336,23 +336,51 @@ local function makeScriptProxy(state)
 	state.scriptChildren = state.scriptChildren or {}
 	local mt = {}
 	mt.__index = function(_, key)
-		if key == "Parent" then return state.folder end
+		if key == "Parent" then
+			return rawget(proxy, "__parentOverride") or state.folder
+		end
 		if key == "WaitForChild" then
 			return function(_, name, timeout)
 				if state.scriptChildren[name] then return state.scriptChildren[name] end
+				local override = rawget(proxy, "__parentOverride")
+				if override then
+					local found = override:FindFirstChild(name)
+					if found then return found end
+				end
 				return state.folder:WaitForChild(name, timeout)
 			end
 		end
 		if key == "FindFirstChild" then
 			return function(_, name)
-				return state.scriptChildren[name] or state.folder:FindFirstChild(name)
+				return state.scriptChildren[name] or (rawget(proxy, "__parentOverride") and rawget(proxy, "__parentOverride"):FindFirstChild(name)) or state.folder:FindFirstChild(name)
 			end
 		end
 		if state.scriptChildren[key] then return state.scriptChildren[key] end
 		return state.folder:FindFirstChild(key)
 	end
 	mt.__newindex = function(_, key, value)
-		if key == "Parent" then return end
+		if key == "Parent" then
+			-- Old scripts reparent themselves. The HopperBin
+			-- pattern is `if script.Parent.className ~= "HopperBin"
+			-- then ... script.Parent = Tool end`, then the script
+			-- uses script.Parent (here, Bin) for Selected and
+			-- friends. Ignoring the write left Bin pointing at
+			-- the build folder, so Bin.Selected errored as "not
+			-- a valid member of Folder". Store the override so
+			-- later reads see the new parent. A proxy table is
+			-- unwrapped to its real Instance; anything else that
+			-- is not an Instance errors, like the engine would.
+			if value == nil then
+				rawset(proxy, "__parentOverride", nil)
+				return
+			end
+			local real = unwrap(value, state)
+			if typeof(real) ~= "Instance" then
+				error("script.Parent must be an Instance", 0)
+			end
+			rawset(proxy, "__parentOverride", real)
+			return
+		end
 		rawset(proxy, key, value)
 	end
 	setmetatable(proxy, mt)
