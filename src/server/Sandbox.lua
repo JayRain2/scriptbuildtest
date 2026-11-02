@@ -1187,6 +1187,36 @@ local function buildEnv(player, state, runId)
 	env.script = scriptProxy
 	env.Instance = { new = instanceNew }
 	env.Content = Content
+	-- LoadLibrary (removed from Roblox years ago, but old
+	-- scripts still call LoadLibrary("RbxUtility").Create).
+	-- Returns a table with the RbxUtility-style Create helper:
+	-- Create(class) returns a function that builds the instance
+	-- and applies a props table. Parent/Adornee/PlayerToHideFrom
+	-- values are unwrapped, so Create("BindableEvent")({Parent
+	-- = script}) lands in the build folder instead of erroring
+	-- on the proxy table. Any library name returns the helper:
+	-- the real libraries are gone, and Create is what scripts
+	-- actually used from them.
+	local function rbxCreate(className)
+		return function(props)
+			local inst = instanceNew(className)
+			if type(props) == "table" then
+				for k, v in pairs(props) do
+					if type(k) == "string" then
+						if k == "Parent" or k == "Adornee" or k == "PlayerToHideFrom" then
+							inst[k] = unwrap(v, state)
+						else
+							inst[k] = v
+						end
+					end
+				end
+			end
+			return inst
+		end
+	end
+	env.LoadLibrary = function(_name)
+		return { Create = rbxCreate }
+	end
 	-- NLS: the old script-builder helper for client code.
 	-- NLS(source, parent) creates a real LocalScript from source,
 	-- parented to parent (default: the player's Backpack), and
@@ -1306,6 +1336,65 @@ end
 -- Run
 --------------------------------------------------------------------------------
 
+-- Parallel compile (v15.5): Ception's compile is pure compute
+-- (string in, bytecode string out) and never yields, so on the
+-- main thread a big script freezes the whole game for seconds
+-- even inside task.spawn -- Luau is cooperative, and a thread
+-- that never yields blocks every other thread. The compile is
+-- therefore handed to a worker script under an Actor (created
+-- by Main at startup): the worker compiles on a real worker
+-- thread while this thread yields on task.wait polls, so the
+-- game keeps simulating. Loading the bytecode and running it
+-- still happen here on the main thread, because execution
+-- touches Instances and is not parallel-safe -- only the
+-- compile moves. Returns bytecode, or nil plus an error string
+-- for a genuine source error; returns nil, nil whenever the
+-- parallel path is unavailable, busy, or slow, and the caller
+-- then compiles on the main thread as before.
+local cachedShared = nil
+local function compileParallel(source)
+	local shared = cachedShared
+	if not shared then
+		local ok, mod = pcall(function()
+			return require(script.Parent:WaitForChild("ScriptBuilderShared", 5))
+		end)
+		if not ok or type(mod) ~= "table" then return nil, nil end
+		cachedShared = mod
+		shared = mod
+	end
+	if shared.reqBusy then
+		local waited = 0
+		while shared.reqBusy and waited < 5 do
+			task.wait(0.1)
+			waited = waited + 0.1
+		end
+		if shared.reqBusy then return nil, nil end
+	end
+	shared.reqId = (shared.reqId or 0) + 1
+	shared.reqSource = source
+	shared.resBytecode = ""
+	shared.resError = ""
+	shared.resKind = ""
+	shared.resDone = false
+	shared.reqBusy = true
+	local waited = 0
+	while not shared.resDone and waited < 120 do
+		task.wait(0.05)
+		waited = waited + 0.05
+	end
+	local done = shared.resDone
+	local kind = shared.resKind
+	local bytecode = shared.resBytecode
+	local err = shared.resError
+	shared.reqBusy = false
+	if not done then return nil, nil end
+	if kind == "sourceError" then
+		return nil, "ScriptBuilder" .. err
+	end
+	if kind ~= "ok" or bytecode == "" then return nil, nil end
+	return bytecode, nil
+end
+
 -- Compiles and runs one fixed script for one player. Returns
 -- ok, err. Print output lands in state.output; created
 -- instances land in state.created (Main reports both).
@@ -1339,7 +1428,16 @@ function Sandbox.run(player, state, fixedSource, reportFn)
 		end
 	end
 
-	local ok, fn = pcall(vLuau.luau_execute, fixedSource, env, "ScriptBuilder", settings)
+	local bytecode, compileErr = compileParallel(fixedSource)
+	if compileErr then
+		return false, compileErr
+	end
+	local ok, fn
+	if bytecode then
+		ok, fn = pcall(vLuau.luau_load, bytecode, env, settings)
+	else
+		ok, fn = pcall(vLuau.luau_execute, fixedSource, env, "ScriptBuilder", settings)
+	end
 	if not ok then
 		return false, tostring(fn)
 	end
