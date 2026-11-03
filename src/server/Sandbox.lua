@@ -255,6 +255,40 @@ function Sandbox.applyMouseInput(state, packet)
 	end
 end
 
+-- HopperBin selection relay (v16.1): one equip must fire
+-- select() exactly once, whether the engine's server-side
+-- Selected fires, the client's packet arrives, or both.
+-- Consecutive duplicates of the same action within 0.5s
+-- are suppressed; a different action (a deselect between
+-- two selects) always fires.
+local function fireBinRelay(state, binId, action)
+	if state == nil or state.binRelays == nil then return end
+	local relay = state.binRelays[binId]
+	if relay == nil then return end
+	local ev = nil
+	if action == "selected" then
+		ev = relay.selected
+	elseif action == "deselected" then
+		ev = relay.deselected
+	else
+		return
+	end
+	if ev == nil then return end
+	local now = os.clock()
+	state.binRelayLast = state.binRelayLast or {}
+	local last = state.binRelayLast[binId]
+	if last ~= nil and last.action == action and now - last.time < 0.5 then return end
+	state.binRelayLast[binId] = { action = action, time = now }
+	local mouse = state.mouseObject
+	if mouse == nil then return end
+	ev:Fire(mouse)
+end
+
+function Sandbox.applyBinInput(state, packet)
+	if type(packet) ~= "table" or packet.type ~= "bin" then return end
+	fireBinRelay(state, packet.binId, packet.action)
+end
+
 --------------------------------------------------------------------------------
 -- Proxies
 --------------------------------------------------------------------------------
@@ -926,6 +960,11 @@ local function buildEnv(player, state, runId)
 		mt.__newindex = function() end -- mouse properties are read-only to scripts
 		setmetatable(mouseObject, mt)
 	end
+	-- The bin relay (v16.1) fires select() with this same
+	-- object, so a HopperBin script gets the emulated mouse
+	-- instead of the engine mouse, whose signals do not
+	-- fire for server-side scripts.
+	state.mouseObject = mouseObject
 
 	local scriptProxy = makeScriptProxy(state)
 
@@ -1314,6 +1353,51 @@ local function buildEnv(player, state, runId)
 			local removed = createTrackedInstance(state, "BindableEvent", folder)
 			removed.Name = "ChildRemoved"
 			placeholder = folder
+		elseif name == "ControllerService" then
+			-- Old tool scripts grab the character's controller
+			-- as ControllerService:GetChildren()[1] and then
+			-- re-parent it (HoloSword restores it at the end
+			-- of every attack). An empty Folder makes that
+			-- [1] nil, and the restore line dies with
+			-- "attempt to index nil with 'Parent'". So this
+			-- placeholder always reports exactly one child:
+			-- an inert dummy that swallows every read and
+			-- write, so the re-parenting is a harmless no-op
+			-- (the builder cannot disable character control
+			-- through the removed ControllerService anyway).
+			-- The dummy is the same object on every call,
+			-- so scripts comparing it across calls agree.
+			local dummy
+			local added = Instance.new("BindableEvent")
+			local removedEv = Instance.new("BindableEvent")
+			state.created[#state.created + 1] = added
+			state.created[#state.created + 1] = removedEv
+			placeholder = {
+				Name = "ControllerService",
+				ChildAdded = added.Event,
+				ChildRemoved = removedEv.Event,
+				GetChildren = function() return { dummy } end,
+				GetDescendants = function() return { dummy } end,
+				FindFirstChild = function() return nil end,
+				IsA = function(_, c) return c == "ControllerService" or c == "Instance" end,
+			}
+			dummy = setmetatable({}, {
+				__index = function(_, k)
+					if k == "Name" then return "Controller" end
+					if k == "Parent" then return placeholder end
+					if k == "GetChildren" or k == "GetDescendants" then
+						return function() return {} end
+					end
+					if k == "FindFirstChild" then
+						return function() return nil end
+					end
+					if k == "IsA" then
+						return function(_, c) return c == "Controller" end
+					end
+					return function() end
+				end,
+				__newindex = function() end,
+			})
 		else
 			placeholder = createTrackedInstance(state, "Folder", nil)
 			placeholder.Name = name
@@ -1388,6 +1472,60 @@ local function buildEnv(player, state, runId)
 	}
 	local SHIM_CANON = {}
 	for c in pairs(SHIM_CLASSES) do SHIM_CANON[string.lower(c)] = c end
+	-- HopperBin proxy (v16.1): old bin tools (Grab Knife
+	-- and thousands like it) connect bin.Selected and expect
+	-- the mouse it passes. The engine's server-side Selected
+	-- does not reliably fire, so the script side gets relay
+	-- events instead: the client forwards its own Selected /
+	-- Deselected through the Input remote (see applyBinInput
+	-- and the Gui watcher), and the engine's signal, when it
+	-- does fire, feeds the same relay, debounced so one
+	-- equip fires select() exactly once. Everything else
+	-- (Name, Parent, methods, other signals) forwards to the
+	-- real bin in the player's Backpack. The bin is
+	-- identified to the client by an SB_BinId attribute.
+	local function makeHopperBinProxy(parent)
+		local realBin = createTrackedInstance(state, "HopperBin", parent)
+		state.nextBinId = (state.nextBinId or 0) + 1
+		local binId = state.nextBinId
+		pcall(function() realBin:SetAttribute("SB_BinId", binId) end)
+		local selEv = Instance.new("BindableEvent")
+		local deselEv = Instance.new("BindableEvent")
+		state.created[#state.created + 1] = selEv
+		state.created[#state.created + 1] = deselEv
+		state.binRelays = state.binRelays or {}
+		state.binRelays[binId] = { selected = selEv, deselected = deselEv }
+		pcall(function()
+			realBin.Selected:Connect(function() fireBinRelay(state, binId, "selected") end)
+			realBin.Deselected:Connect(function() fireBinRelay(state, binId, "deselected") end)
+		end)
+		local proxy = {}
+		local mt = {}
+		mt.__index = function(_, key)
+			if key == "Selected" then return selEv.Event end
+			if key == "Deselected" then return deselEv.Event end
+			local v = realBin[key]
+			if type(v) == "function" then
+				return function(_, ...) return v(realBin, ...) end
+			end
+			return v
+		end
+		mt.__newindex = function(_, key, value)
+			if key == "Parent" then
+				local real = unwrap(value, state)
+				if typeof(real) == "Instance" then
+					realBin.Parent = real
+				else
+					realBin.Parent = nil
+				end
+			else
+				realBin[key] = value
+			end
+		end
+		setmetatable(proxy, mt)
+		return proxy
+	end
+
 	local function instanceNew(className, parent)
 		-- Created Scripts and LocalScripts (v16) do not go
 		-- through createTrackedInstance: a real Script would
@@ -1398,6 +1536,9 @@ local function buildEnv(player, state, runId)
 		-- and a parent are set.
 		if className == "Script" or className == "LocalScript" then
 			return makeScriptShim(className == "LocalScript", parent)
+		end
+		if type(className) == "string" and string.lower(className) == "hopperbin" then
+			return makeHopperBinProxy(parent)
 		end
 		local shimClass = SHIM_CLASSES[className] and className or SHIM_CANON[string.lower(className)]
 		if shimClass then
@@ -1525,6 +1666,33 @@ local function buildEnv(player, state, runId)
 			error("NLS source is " .. #source .. " chars, over the 200000-char Source limit for one script", 0)
 		end
 		local fixedClient = ScriptFixer.fixClientSource(source)
+		-- v16.1: the client pass rewrites limb/mesh lookups
+		-- to helpers that do not exist on a real client, so
+		-- define them at the top when the rewritten source
+		-- uses them. A local at the top of the chunk is in
+		-- scope for the whole chunk.
+		if fixedClient:find("__sbFindLimb", 1, true) then
+			fixedClient = "local __sbFindLimb = function(model, name, recursive)\n"
+				.. "local found = model:FindFirstChild(name, recursive)\n"
+				.. "if found then return found end\n"
+				.. "local fallbacks = ({Torso = {\"UpperTorso\", \"LowerTorso\"}, [\"Left Arm\"] = {\"LeftUpperArm\", \"LeftLowerArm\"}, [\"Right Arm\"] = {\"RightUpperArm\", \"RightLowerArm\"}, [\"Left Leg\"] = {\"LeftUpperLeg\", \"LeftLowerLeg\"}, [\"Right Leg\"] = {\"RightUpperLeg\", \"RightLowerLeg\"}})[name]\n"
+				.. "if fallbacks then\n"
+				.. "for _, cand in ipairs(fallbacks) do\n"
+				.. "found = model:FindFirstChild(cand, recursive)\n"
+				.. "if found then return found end\n"
+				.. "end\n"
+				.. "end\n"
+				.. "return nil\n"
+				.. "end\n" .. fixedClient
+		end
+		if fixedClient:find("__sbMesh", 1, true) then
+			fixedClient = "local __sbMesh = function(inst)\n"
+				.. "if typeof(inst) == \"Instance\" then\n"
+				.. "return inst:FindFirstChild(\"Mesh\") or inst:FindFirstChildOfClass(\"SpecialMesh\") or inst:FindFirstChildOfClass(\"BlockMesh\") or inst:FindFirstChildOfClass(\"CylinderMesh\")\n"
+				.. "end\n"
+				.. "return inst.Mesh\n"
+				.. "end\n" .. fixedClient
+		end
 		local targetParent
 		if parent == nil then
 			targetParent = player.Backpack
@@ -1773,6 +1941,39 @@ local function buildEnv(player, state, runId)
 			end
 		end
 		return v
+	end
+	-- __sbFindLimb (v16.1): R6 limb lookup that also finds
+	-- the R15 part. ScriptFixer rewrites :FindFirstChild
+	-- ("Torso"/"Left Arm"/...) to this, so scripts that look
+	-- a Torso up on a REAL model (another player's character,
+	-- where the R6 character proxy does not apply) keep
+	-- working on R15 characters. The literal name is tried
+	-- first, so R6 characters are unchanged.
+	env.__sbFindLimb = function(model, name, recursive)
+		local found = model:FindFirstChild(name, recursive)
+		if found then return found end
+		local fallbacks = R6_MAP[name]
+		if fallbacks then
+			for _, cand in ipairs(fallbacks) do
+				found = model:FindFirstChild(cand, recursive)
+				if found then return found end
+			end
+		end
+		return nil
+	end
+	-- __sbMesh (v16.1): old child-dot access (.Mesh).
+	-- No Instance has a Mesh property, so a dotted .Mesh
+	-- is always a child lookup in old scripts: first a
+	-- child literally named "Mesh", then any mesh by class.
+	-- Non-Instances keep their original field behaviour.
+	env.__sbMesh = function(inst)
+		if typeof(inst) == "Instance" then
+			return inst:FindFirstChild("Mesh")
+				or inst:FindFirstChildOfClass("SpecialMesh")
+				or inst:FindFirstChildOfClass("BlockMesh")
+				or inst:FindFirstChildOfClass("CylinderMesh")
+		end
+		return inst.Mesh
 	end
 	-- ypcall: the yieldable pcall old exploit-era scripts
 	-- expect. Luau's pcall supports yielding, unlike Lua
