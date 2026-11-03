@@ -90,6 +90,14 @@ for _, c in ipairs({
 	"Explosion", "HopperBin", "Motor",
 	"Glue", "Humanoid", "Vector3Value",
 	"ColorCorrectionEffect", "Color3Value",
+	-- v16, from the srzmnx/OLD-roblox-scripts scan (15,768
+	-- scripts): every one of these is a real modern class
+	-- old scripts create, and none was on the list.
+	"ClickDetector", "Handles", "ArcHandles", "Camera", "Team",
+	"CFrameValue", "Dialog", "DialogChoice", "BoxHandleAdornment",
+	"Animator", "RopeConstraint", "TrussPart", "BrickColorValue",
+	"DoubleConstrainedValue", "IntConstrainedValue", "SunRaysEffect",
+	"BloomEffect", "BlurEffect", "SkateboardPlatform", "TouchTransmitter",
 }) do ALLOWED_CLASSES[c] = true end
 
 local BLOCKED_CLASSES = {
@@ -520,6 +528,42 @@ end
 -- SurfaceGuis), so repaired objects are also cleared by
 -- Clear Builds. The Heartbeat relay is built on this too: it is
 -- a tracked parentless BindableEvent, and Clear destroys it.
+-- Legacy class mappings (v16, from the srzmnx scan): old
+-- classes that no longer exist map to their modern
+-- equivalent, the way Motor -> Motor6D and Glue -> Weld
+-- already did. GuiMain was the pre-ScreenGui GUI container;
+-- FileMesh was SpecialMesh before MeshType existed; Wedge
+-- was renamed WedgePart; a script-created PlayerGui becomes
+-- a Folder named PlayerGui (the real PlayerGui always exists
+-- for real players, so the old ensure-it-exists pattern is
+-- dead code, but creating one must not kill the script).
+local CLASS_MAP = {
+	Motor = "Motor6D",
+	Glue = "Weld",
+	GuiMain = "ScreenGui",
+	FileMesh = "SpecialMesh",
+	Wedge = "WedgePart",
+	PlayerGui = "Folder",
+	-- Rotate joints carry exactly Weld's properties
+	-- (Part0/Part1/C0/C1), so a Weld holds the joint.
+	Rotate = "Weld",
+	-- The old controller classes are only ever parented
+	-- to ControllerService (no property is ever set on
+	-- them in the scan), so a Folder holds them.
+	HumanoidController = "Folder",
+	SkateboardController = "Folder",
+	VehicleController = "Folder",
+}
+-- Case-insensitive canonicalization (v16): old Roblox
+-- Instance.new accepted any case for class names, so
+-- "Hopperbin" worked. Modern Roblox is case-sensitive, so
+-- canonicalize known classes instead of erroring. Mapping
+-- targets win over plain allow-list entries (Motor -> Motor6D,
+-- not Motor), because the mapping loop runs second.
+local CLASS_CANON = {}
+for c in pairs(ALLOWED_CLASSES) do CLASS_CANON[string.lower(c)] = c end
+for src, dst in pairs(CLASS_MAP) do CLASS_CANON[string.lower(src)] = dst end
+
 createTrackedInstance = function(state, className, parent, allowBlocked)
 	if type(className) ~= "string" then
 		error("Instance.new expects a string class name", 0)
@@ -527,19 +571,63 @@ createTrackedInstance = function(state, className, parent, allowBlocked)
 	if not allowBlocked and BLOCKED_CLASSES[className] then
 		error("Instance.new(" .. className .. ") is not allowed in the sandbox", 0)
 	end
-	if className == "Motor" then className = "Motor6D" end
-	if className == "Glue" then className = "Weld" end
+	-- Backpack (v16): old scripts create a Backpack on a
+	-- player and clone tools into it. A real Backpack cannot
+	-- be created, so hand back the target player's real
+	-- Backpack instead: tools parented to it land in the
+	-- inventory, which is what the script wants. The real
+	-- Backpack is the engine's, so it is NOT tracked and
+	-- Clear never destroys it; the tools parented to it are
+	-- tracked and Clear removes them. A parent that is a
+	-- character Model resolves to that character's player.
+	if className == "Backpack" then
+		local target = state.player
+		if parent ~= nil then
+			local real = unwrap(parent, state)
+			if typeof(real) == "Instance" then
+				if real:IsA("Player") then
+					target = real
+				elseif real:IsA("Model") then
+					local owner = Players:GetPlayerFromCharacter(real)
+					if owner then target = owner end
+				end
+			end
+		end
+		if target then
+			local ok, bp = pcall(function() return target.Backpack end)
+			if ok and bp then return bp end
+		end
+		className = "Folder"
+	end
+	local requestedClass = className
+	if CLASS_MAP[className] then className = CLASS_MAP[className] end
 	if not allowBlocked and not ALLOWED_CLASSES[className] then
-		error("Instance.new(" .. className .. ") is not allowed in the sandbox", 0)
+		local canon = CLASS_CANON[string.lower(className)]
+		if canon then
+			className = canon
+		else
+			error("Instance.new(" .. className .. ") is not allowed in the sandbox", 0)
+		end
 	end
 	local inst = Instance.new(className)
+	if string.lower(requestedClass) == "playergui" then
+		inst.Name = "PlayerGui"
+	end
 	state.created[#state.created + 1] = inst
 	if parent ~= nil then
 		if type(parent) == "table" and parent.__isScriptProxy then
 			inst.Parent = state.folder
 			if inst.Name then state.scriptChildren[inst.Name] = inst end
 		else
-			inst.Parent = unwrap(parent, state)
+			-- A parent that is not an Instance (old scripts
+			-- pass strings like "Tool" and re-parent on the
+			-- next line) becomes parentless instead of
+			-- erroring: the script's own Parent assignment
+			-- still lands where it intends.
+			local real = unwrap(parent, state)
+			if typeof(real) == "Instance" then
+				inst.Parent = real
+			end
 		end
 	end
 	connectAssetWatchers(state, inst)
@@ -1102,7 +1190,136 @@ local function buildEnv(player, state, runId)
 			return cas
 		end
 		if allowed[name] then return allowed[name] end
-		error("GetService(" .. tostring(name) .. ") is not allowed in the sandbox", 0)
+		-- Real services added in v16 (pcall-guarded, so a
+		-- name that is not a service on this build can never
+		-- break buildEnv for every script).
+		local REAL_EXTRA = { PhysicsService = true, GuiService = true, StarterPlayer = true }
+		if REAL_EXTRA[name] then
+			local ok, svc = pcall(function() return game:GetService(name) end)
+			if ok and svc then return svc end
+		end
+		-- Per-state placeholders (v16): removed or blocked
+		-- services return the same inert object on every call
+		-- within a player state, so scripts that merely list
+		-- services (admin explorers) or check for one keep
+		-- running. The object is a Folder for most services,
+		-- so .Name and :GetChildren() work; the dangerous
+		-- calls themselves (Teleport, PromptPurchase, GetAsync,
+		-- GetDataStore, AwardBadge) still fail, because a
+		-- Folder does not have them. Unknown names still
+		-- error, so a typo'd service name is not silently
+		-- hidden. Clear Builds drops the cache (see Main),
+		-- so placeholders are rebuilt fresh next run.
+		state.servicePlaceholders = state.servicePlaceholders or {}
+		if state.servicePlaceholders[name] then
+			return state.servicePlaceholders[name]
+		end
+		local KNOWN_SERVICES = {
+			Workspace = true, Players = true, Lighting = true, Teams = true,
+			StarterPack = true, StarterGui = true, StarterPlayer = true,
+			StarterCharacterScripts = true, StarterPlayerScripts = true,
+			ReplicatedStorage = true, ReplicatedFirst = true, ServerStorage = true,
+			ServerScriptService = true, Chat = true, Debris = true, RunService = true,
+			TweenService = true, SoundService = true, TextService = true,
+			CollectionService = true, InsertService = true, AssetService = true,
+			ContentProvider = true, LogService = true, UserInputService = true,
+			ContextActionService = true, GuiService = true, PhysicsService = true,
+			Selection = true, ScriptContext = true, ControllerService = true,
+			CoreGui = true, NetworkServer = true, NetworkClient = true,
+			Geometry = true, FriendService = true, JointsService = true,
+			HttpService = true, DataStoreService = true, MarketplaceService = true,
+			TeleportService = true, BadgeService = true, PointsService = true,
+			SocialService = true, Stats = true, TestService = true,
+			PathfindingService = true, VirtualUser = true, PersonalServerService = true,
+			LocalBackpack = true, TimerService = true, ChangeHistoryService = true,
+			CookiesService = true, ContentFilter = true, KeyframeSequenceProvider = true,
+			ScriptInformationProvider = true, RenderHooksService = true,
+			RobloxReplicatedStorage = true, Visit = true, Soundscape = true,
+			SoundScape = true, LocalizationService = true, AnalyticsService = true,
+			PolicyService = true, AvatarEditorService = true,
+			MemoryStoreService = true, MessagingService = true,
+		}
+		if not KNOWN_SERVICES[name] then
+			error("GetService(" .. tostring(name) .. ") is not allowed in the sandbox", 0)
+		end
+		local placeholder
+		if name == "Selection" then
+			-- Build tools read Selection:Get(); in-game the
+			-- selection is empty, so that is what it returns.
+			placeholder = {
+				Get = function() return {} end,
+				Set = function() end,
+			}
+		elseif name == "ScriptContext" then
+			-- Admin scripts set ScriptsDisabled; the flag is
+			-- accepted and ignored (the builder cannot disable
+			-- the engine's scripts, and must not). The
+			-- lifecycle methods scripts call on it are
+			-- present so those scripts do not die on them.
+			local errEv = Instance.new("BindableEvent")
+			state.created[#state.created + 1] = errEv
+			placeholder = {
+				ScriptsDisabled = false,
+				Error = errEv.Event,
+				Destroy = function() end,
+				Remove = function() end,
+				BreakJoints = function() end,
+				GetChildren = function() return {} end,
+				FindFirstChild = function() return nil end,
+				IsA = function(_, c) return c == "ScriptContext" or c == "Instance" end,
+			}
+		elseif name == "NetworkServer" then
+			-- IncommingConnection is the real old spelling
+			-- (double m); both spellings are provided, and
+			-- neither ever fires in the builder.
+			local ev = Instance.new("BindableEvent")
+			state.created[#state.created + 1] = ev
+			placeholder = {
+				IncommingConnection = ev.Event,
+				IncomingConnection = ev.Event,
+				GetChildren = function() return {} end,
+			}
+		elseif name == "NetworkClient" then
+			local ev = Instance.new("BindableEvent")
+			state.created[#state.created + 1] = ev
+			placeholder = {
+				ClientReplicator = { MachineAddress = "127.0.0.1", Port = 0 },
+				Disconnect = function() end,
+				Connect = ev.Event,
+				PlayerConnect = ev.Event,
+				PlayerConnected = ev.Event,
+				Ticket = "",
+			}
+		elseif name == "CoreGui" then
+			-- A Folder named CoreGui holding the core GUI
+			-- children scripts actually touch (RobloxGui
+			-- with its SendNotification event, ObjectHighlight,
+			-- ExplorerGui, CommandBar, ChildRemoved): admin
+			-- scripts that fire notifications through CoreGui
+			-- no longer hang on WaitForChild, and scripts
+			-- that parent GUIs to CoreGui hold them without
+			-- erroring. They do not render: the server has
+			-- no client CoreGui to show them in, and that
+			-- limit is reported, not hidden.
+			local folder = createTrackedInstance(state, "Folder", nil)
+			folder.Name = "CoreGui"
+			local robloxGui = createTrackedInstance(state, "Folder", folder)
+			robloxGui.Name = "RobloxGui"
+			local notif = createTrackedInstance(state, "BindableEvent", robloxGui)
+			notif.Name = "SendNotification"
+			for _, childName in ipairs({ "ObjectHighlight", "ExplorerGui", "CommandBar" }) do
+				local child = createTrackedInstance(state, "Folder", folder)
+				child.Name = childName
+			end
+			local removed = createTrackedInstance(state, "BindableEvent", folder)
+			removed.Name = "ChildRemoved"
+			placeholder = folder
+		else
+			placeholder = createTrackedInstance(state, "Folder", nil)
+			placeholder.Name = name
+		end
+		state.servicePlaceholders[name] = placeholder
+		return placeholder
 	end
 
 	local gameProxy = {
@@ -1118,12 +1335,74 @@ local function buildEnv(player, state, runId)
 		ReplicatedFirst = game:GetService("ReplicatedFirst"),
 		LogService = game:GetService("LogService"),
 		ReplicatedStorage = game:GetService("ReplicatedStorage"),
+		-- Direct service properties (v16): old scripts read
+		-- these off game as often as through GetService.
+		TweenService = game:GetService("TweenService"),
+		SoundService = game:GetService("SoundService"),
+		StarterGui = game:GetService("StarterGui"),
+		StarterPack = game:GetService("StarterPack"),
+		Teams = game:GetService("Teams"),
+		TextService = game:GetService("TextService"),
+		CollectionService = game:GetService("CollectionService"),
+		ServerStorage = game:GetService("ServerStorage"),
+		PhysicsService = game:GetService("PhysicsService"),
+		GuiService = game:GetService("GuiService"),
+		StarterPlayer = game:GetService("StarterPlayer"),
 		PlaceId = game.PlaceId,
 		GetService = getService,
 		service = getService,
+		Service = getService,
+		-- GetObjects (v16): the old game:GetObjects(assetId)
+		-- loader, via the same AssetService path as
+		-- InsertService:LoadAsset, wrapped in the array old
+		-- scripts index ([1]) into.
+		GetObjects = function(a, b)
+			local id = b or a
+			local num = tonumber(id) or (type(id) == "string" and tonumber(id:match("(%d+)$")))
+			if not num or num <= 0 then
+				error("game:GetObjects expects an asset id", 0)
+			end
+			return { insertProxy.LoadAsset(insertProxy, num) }
+		end,
 	}
 
+	-- Forward declarations: the shim factories are assigned
+	-- below, after env.NLS exists, so they can close over env.
+	local makeScriptShim
+	local makeLegacyShim
+	-- Inert legacy classes (v16, from the srzmnx scan): old
+	-- classes with no modern equivalent and no physics the
+	-- builder could reproduce (lasso selection visuals, the
+	-- FloorWire joint visual, the manual surface joint).
+	-- Scripts create them and set properties on them; a
+	-- shim table accepts every property and method call
+	-- without erroring, renders nothing, and holds no
+	-- children. That is the honest stand-in: the script
+	-- runs, the legacy visual does not.
+	local SHIM_CLASSES = {
+		SelectionPartLasso = true,
+		SelectionPointLasso = true,
+		ManualSurfaceJointInstance = true,
+		FloorWire = true,
+		Skin = true,
+	}
+	local SHIM_CANON = {}
+	for c in pairs(SHIM_CLASSES) do SHIM_CANON[string.lower(c)] = c end
 	local function instanceNew(className, parent)
+		-- Created Scripts and LocalScripts (v16) do not go
+		-- through createTrackedInstance: a real Script would
+		-- run outside the sandbox, and a server-created
+		-- LocalScript would never run at all. They become
+		-- shims that execute their Source in the sandbox
+		-- (server) or through NLS (client) once both Source
+		-- and a parent are set.
+		if className == "Script" or className == "LocalScript" then
+			return makeScriptShim(className == "LocalScript", parent)
+		end
+		local shimClass = SHIM_CLASSES[className] and className or SHIM_CANON[string.lower(className)]
+		if shimClass then
+			return makeLegacyShim(shimClass, parent)
+		end
 		return createTrackedInstance(state, className, parent)
 	end
 
@@ -1185,6 +1464,15 @@ local function buildEnv(player, state, runId)
 	env.Workspace = workspace
 	env.player = localPlayerProxy
 	env.script = scriptProxy
+	-- _G and shared (v16): old scripts coordinate through
+	-- these globals, sometimes across scripts (one script
+	-- sets shared.ptick, another script's loop reads it).
+	-- They live on the player state, so every script the
+	-- player runs sees the same tables, and Clear Builds
+	-- resets them (see Main).
+	state.sharedTables = state.sharedTables or { _G = {}, shared = {} }
+	env._G = state.sharedTables._G
+	env.shared = state.sharedTables.shared
 	env.Instance = { new = instanceNew }
 	env.Content = Content
 	-- LoadLibrary (removed from Roblox years ago, but old
@@ -1250,6 +1538,223 @@ local function buildEnv(player, state, runId)
 	end
 	env.fixAsset = function(inst, property)
 		Sandbox.fixAsset(state, inst, property)
+	end
+	-- Created Script / LocalScript shims (v16). A shim is a
+	-- table, not an Instance: it captures Source, Disabled,
+	-- Name and Parent, and runs once both Source and a real
+	-- parent are set, whichever order they arrive in. A
+	-- server Script runs its (Fixer-passed) source in a
+	-- fresh sandbox env whose `script` is the shim itself,
+	-- on a spawned thread so a looping created script cannot
+	-- hang the script that created it; its waits die with
+	-- the parent run (same runId) and Clear Builds drops it
+	-- with everything else. A LocalScript goes through NLS,
+	-- which already builds a real tracked LocalScript. A
+	-- shim never runs while parentless, Disabled, or
+	-- source-less, matching the engine.
+	makeScriptShim = function(isLocal, parent)
+		local shim = {}
+		local fields = {
+			Name = isLocal and "LocalScript" or "Script",
+			ClassName = isLocal and "LocalScript" or "Script",
+			Source = "",
+			Disabled = false,
+			Parent = parent,
+		}
+		local ran = false
+		local destroyed = false
+		local function unwrapParent()
+			local p = fields.Parent
+			if p == nil then return nil end
+			local real = unwrap(p, state)
+			if typeof(real) == "Instance" then return real end
+			return nil
+		end
+		local function maybeRun()
+			if ran or destroyed then return end
+			if fields.Disabled then return end
+			if fields.Source == "" then return end
+			local target = unwrapParent()
+			if not target then return end
+			ran = true
+			if isLocal then
+				local ok, err = pcall(function()
+					env.NLS(fields.Source, target)
+				end)
+				if not ok then
+					printToClient("[created LocalScript] " .. tostring(err))
+				end
+				return
+			end
+			task.spawn(function()
+				local ok, err = pcall(function()
+					local fixed = ScriptFixer.fix(fields.Source)
+					local env2 = buildEnv(realPlayer, state, runId)
+					env2.script = shim
+					local settings = vLuau.create_settings()
+					settings.generalizedIteration = true
+					local hooks = 0
+					local windowStart = os.clock()
+					settings.callHooks.interruptHook = function()
+						hooks = hooks + 1
+						local now = os.clock()
+						if now - windowStart > 30 then
+							windowStart = now
+							hooks = 0
+						elseif hooks > 2000000 then
+							error("Script hit the run limit (infinite loop protection)", 0)
+						end
+					end
+					local bytecode, compileErr = compileParallel(fixed)
+					if compileErr then error(compileErr, 0) end
+					local loadOk, fn
+					if bytecode then
+						loadOk, fn = pcall(vLuau.luau_load, bytecode, env2, settings)
+					else
+						loadOk, fn = pcall(vLuau.luau_execute, fixed, env2, "ScriptBuilder", settings)
+					end
+					if not loadOk then error(tostring(fn), 0) end
+					fn()
+				end)
+				if not ok then
+					printToClient("[created Script] " .. tostring(err))
+				end
+			end)
+		end
+		local mt = {}
+		mt.__index = function(_, key)
+			if key == "Parent" or key == "Name" or key == "ClassName" or key == "Source" or key == "Disabled" then
+				return fields[key]
+			end
+			if key == "Destroy" or key == "Remove" then
+				return function()
+					destroyed = true
+				end
+			end
+			if key == "IsA" then
+				return function(_, className)
+					return className == fields.ClassName or className == "LuaSourceContainer" or className == "Instance"
+				end
+			end
+			if key == "FindFirstChild" then
+				return function(_, childName)
+					local target = unwrapParent()
+					if target then return target:FindFirstChild(childName) end
+					return nil
+				end
+			end
+			if key == "WaitForChild" then
+				return function(_, childName, timeout)
+					local target = unwrapParent()
+					if target then return target:WaitForChild(childName, timeout) end
+					return nil
+				end
+			end
+			if key == "GetChildren" then
+				return function() return {} end
+			end
+			if key == "Clone" then
+				return function()
+					-- Engine Clone is parentless, so the copy
+					-- must not run until it is parented.
+					local copy = makeScriptShim(isLocal, nil)
+					copy.Source = fields.Source
+					copy.Name = fields.Name
+					return copy
+				end
+			end
+			return nil
+		end
+		mt.__newindex = function(_, key, value)
+			if key == "Parent" or key == "Name" or key == "Source" or key == "Disabled" then
+				fields[key] = value
+				if key == "Parent" or key == "Source" then
+					maybeRun()
+				end
+				return
+			end
+			fields[key] = value
+		end
+		setmetatable(shim, mt)
+		return shim
+	end
+	-- Legacy-instance shims (v16). See SHIM_CLASSES above
+	-- for why these are tables, not Instances. Skin is the
+	-- one shim with real behavior: its SkinColor is applied
+	-- to the parent character's BodyColors, which is how
+	-- modern Roblox expresses what Skin used to do.
+	local function applySkin(fields)
+		local color = fields.SkinColor
+		if color == nil then return end
+		local p = fields.Parent
+		if p == nil then return end
+		local real = unwrap(p, state)
+		if typeof(real) ~= "Instance" or not real:IsA("Model") then return end
+		local ok, bc = pcall(function() return real:FindFirstChildOfClass("BodyColors") end)
+		if ok and not bc then
+			local ok2, newBc = pcall(createTrackedInstance, state, "BodyColors", real)
+			if ok2 then bc = newBc end
+		end
+		if bc then
+			for _, prop in ipairs({ "HeadColor", "TorsoColor", "LeftArmColor", "RightArmColor", "LeftLegColor", "RightLegColor" }) do
+				pcall(function() bc[prop] = color end)
+			end
+		end
+	end
+	makeLegacyShim = function(className, parent)
+		local shim = {}
+		local fields = { Name = className, ClassName = className, Parent = parent }
+		local mt = {}
+		mt.__index = function(_, key)
+			if key == "Parent" or key == "Name" or key == "ClassName" then
+				return fields[key]
+			end
+			if fields[key] ~= nil then return fields[key] end
+			if key == "Destroy" or key == "Remove" or key == "remove" then
+				return function() end
+			end
+			if key == "Clone" or key == "clone" then
+				return function()
+					-- Engine Clone is parentless, so the
+					-- copy must not inherit the parent.
+					local copy = makeLegacyShim(className, nil)
+					for k, v in pairs(fields) do
+						if k ~= "Parent" then copy[k] = v end
+					end
+					return copy
+				end
+			end
+			if key == "IsA" then
+				return function(_, c) return c == className or c == "Instance" end
+			end
+			if key == "FindFirstChild" or key == "findFirstChild" then
+				return function() return nil end
+			end
+			if key == "WaitForChild" then
+				return function() return nil end
+			end
+			if key == "GetChildren" or key == "children" then
+				return function() return {} end
+			end
+			if key == "GetDescendants" then
+				return function() return {} end
+			end
+			if key == "ClearAllChildren" then
+				return function() end
+			end
+			if key == "IsDescendantOf" then
+				return function() return false end
+			end
+			return nil
+		end
+		mt.__newindex = function(_, key, value)
+			fields[key] = value
+			if className == "Skin" and (key == "SkinColor" or key == "Parent") then
+				applySkin(fields)
+			end
+		end
+		setmetatable(shim, mt)
+		return shim
 	end
 	-- __sbUnwrap: maps a sandbox proxy table back to the real
 	-- Instance it stands for, and passes everything else
