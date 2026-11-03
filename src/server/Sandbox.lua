@@ -1099,6 +1099,28 @@ local function buildEnv(player, state, runId)
 		PlayerRemoving = Players.PlayerRemoving,
 	}
 
+	-- Name indexing (v16.2): playersProxy is a plain
+	-- table, so game.Players[Victim] read nil, which is
+	-- where Candy Van died (its kill loop indexes the
+	-- victim by the username typed into the box). A
+	-- missing key is now a player-name lookup: the
+	-- executor comes back as the LocalPlayer proxy (so
+	-- GetMouse and Character keep working), anyone else
+	-- as the real Player, unknown names as nil. The
+	-- table's own methods still win over __index, and
+	-- "LocalPlayer" means the executor, matching what
+	-- the name means everywhere else.
+	setmetatable(playersProxy, {
+		__index = function(_, key)
+			if key == "LocalPlayer" then return localPlayerProxy end
+			if type(key) ~= "string" then return nil end
+			local found = Players:FindFirstChild(key)
+			if found == nil then return nil end
+			if found == realPlayer then return localPlayerProxy end
+			return found
+		end,
+	})
+
 	-- InsertService proxy: user code calls :LoadAsset(id) the
 	-- way old FE scripts did, but the load goes through
 	-- AssetService, and anything it returns is tracked and
@@ -1330,29 +1352,149 @@ local function buildEnv(player, state, runId)
 				Ticket = "",
 			}
 		elseif name == "CoreGui" then
-			-- A Folder named CoreGui holding the core GUI
-			-- children scripts actually touch (RobloxGui
-			-- with its SendNotification event, ObjectHighlight,
-			-- ExplorerGui, CommandBar, ChildRemoved): admin
-			-- scripts that fire notifications through CoreGui
-			-- no longer hang on WaitForChild, and scripts
-			-- that parent GUIs to CoreGui hold them without
-			-- erroring. They do not render: the server has
-			-- no client CoreGui to show them in, and that
-			-- limit is reported, not hidden.
-			local folder = createTrackedInstance(state, "Folder", nil)
-			folder.Name = "CoreGui"
-			local robloxGui = createTrackedInstance(state, "Folder", folder)
-			robloxGui.Name = "RobloxGui"
-			local notif = createTrackedInstance(state, "BindableEvent", robloxGui)
-			notif.Name = "SendNotification"
-			for _, childName in ipairs({ "ObjectHighlight", "ExplorerGui", "CommandBar" }) do
-				local child = createTrackedInstance(state, "Folder", folder)
-				child.Name = childName
+			-- CoreGui emulation (v16.2, supersedes the v16
+			-- Folder placeholder): old scripts parent their
+			-- GUIs to CoreGui (Candy Van: VanGui.Parent =
+			-- game.CoreGui, then game.CoreGui.VanGui.DaGui
+			-- ...). The v16 Folder held those GUIs without
+			-- erroring, but they never rendered. Now
+			-- CoreGui is a wrapper over the executing
+			-- player's real PlayerGui: anything parented
+			-- to it shows up for that player, and reads
+			-- through it resolve against the real
+			-- PlayerGui. The wrapper's Name still reads
+			-- "CoreGui", ClassName reads "CoreGui", and
+			-- the legacy core children (RobloxGui,
+			-- ObjectHighlight, ExplorerGui, CommandBar)
+			-- are kept as inert dummies so admin scripts
+			-- that probe them keep running. The wrapper
+			-- is registered in state.proxyReal, so
+			-- .Parent assignments (via __sbUnwrap) and
+			-- Instance.new parents resolve to the real
+			-- PlayerGui. One deliberate deviation: the
+			-- builder's own ScriptBuilderGui is hidden
+			-- from the wrapper (GetChildren,
+			-- FindFirstChild, child indexing) and skipped
+			-- by ClearAllChildren, so a script that wipes
+			-- CoreGui does not wipe the builder window;
+			-- no old script ever looked for that name.
+			-- Class-based lookups (FindFirstChildOfClass
+			-- and friends) are NOT filtered, so they can
+			-- still return it; that is the accepted gap.
+			-- If the executor somehow has no PlayerGui
+			-- yet, fall back to the old Folder
+			-- placeholder instead of erroring.
+			local realPlayerGui = state.player and state.player:FindFirstChild("PlayerGui")
+			if realPlayerGui == nil then
+				local folder = createTrackedInstance(state, "Folder", nil)
+				folder.Name = "CoreGui"
+				local robloxGui = createTrackedInstance(state, "Folder", folder)
+				robloxGui.Name = "RobloxGui"
+				local notif = createTrackedInstance(state, "BindableEvent", robloxGui)
+				notif.Name = "SendNotification"
+				for _, childName in ipairs({ "ObjectHighlight", "ExplorerGui", "CommandBar" }) do
+					local child = createTrackedInstance(state, "Folder", folder)
+					child.Name = childName
+				end
+				local removed = createTrackedInstance(state, "BindableEvent", folder)
+				removed.Name = "ChildRemoved"
+				placeholder = folder
+			else
+				local proxy = {}
+				local legacyNames = { "RobloxGui", "ObjectHighlight", "ExplorerGui", "CommandBar" }
+				local legacy = {}
+				local function makeLegacyDummy(dummyName)
+					return setmetatable({}, {
+						__index = function(_, k)
+							if k == "Name" then return dummyName end
+							if k == "Parent" then return proxy end
+							if k == "GetChildren" or k == "GetDescendants" then
+								return function() return {} end
+							end
+							if k == "FindFirstChild" then
+								return function() return nil end
+							end
+							if k == "IsA" then
+								return function(_, c) return c == dummyName or c == "Instance" end
+							end
+							return function() end
+						end,
+						__newindex = function() end,
+					})
+				end
+				for _, n in ipairs(legacyNames) do legacy[n] = makeLegacyDummy(n) end
+				local function isBuilderGui(inst)
+					return inst.Name == "ScriptBuilderGui"
+				end
+				setmetatable(proxy, {
+					__index = function(_, key)
+						if key == "Name" or key == "ClassName" then return "CoreGui" end
+						-- Parent is the real game: services
+						-- parent to the DataModel. (Not
+						-- gameProxy: that local is declared
+						-- after getService, so this closure
+						-- would read the global, not it.)
+						if key == "Parent" then return game end
+						if key == "ScriptBuilderGui" then return nil end
+						if legacy[key] then return legacy[key] end
+						if key == "IsA" then
+							return function(_, c)
+								return c == "CoreGui" or realPlayerGui:IsA(c)
+							end
+						end
+						if key == "GetFullName" then
+							return function() return "game.CoreGui" end
+						end
+						if key == "Destroy" then
+							return function() end
+						end
+						if key == "Clone" then
+							return function() return proxy end
+						end
+						if key == "GetChildren" then
+							return function()
+								local out = {}
+								for _, child in ipairs(realPlayerGui:GetChildren()) do
+									if not isBuilderGui(child) then out[#out + 1] = child end
+								end
+								for _, n in ipairs(legacyNames) do out[#out + 1] = legacy[n] end
+								return out
+							end
+						end
+						if key == "FindFirstChild" then
+							return function(_, fname, recursive)
+								if fname == "ScriptBuilderGui" then return nil end
+								local found = realPlayerGui:FindFirstChild(fname, recursive)
+								if found ~= nil then return found end
+								return legacy[fname]
+							end
+						end
+						if key == "ClearAllChildren" then
+							return function()
+								for _, child in ipairs(realPlayerGui:GetChildren()) do
+									if not isBuilderGui(child) then child:Destroy() end
+								end
+							end
+						end
+						local v = realPlayerGui[key]
+						if type(v) == "function" then
+							return function(_, ...) return v(realPlayerGui, ...) end
+						end
+						return v
+					end,
+					__newindex = function(_, key, value)
+						if key == "Name" or key == "Parent" then return end
+						local rv = value
+						if type(value) == "table" and state.proxyReal then
+							rv = state.proxyReal[value] or value
+						end
+						realPlayerGui[key] = rv
+					end,
+				})
+				state.proxyReal = state.proxyReal or {}
+				state.proxyReal[proxy] = realPlayerGui
+				placeholder = proxy
 			end
-			local removed = createTrackedInstance(state, "BindableEvent", folder)
-			removed.Name = "ChildRemoved"
-			placeholder = folder
 		elseif name == "ControllerService" then
 			-- Old tool scripts grab the character's controller
 			-- as ControllerService:GetChildren()[1] and then
@@ -1449,6 +1591,15 @@ local function buildEnv(player, state, runId)
 			return { insertProxy.LoadAsset(insertProxy, num) }
 		end,
 	}
+
+	-- CoreGui (v16.2): game.CoreGui is not in the literal
+	-- above, and gameProxy has no __index fallback, so
+	-- without this it would read nil (which is how Candy
+	-- Van's VanGui ended up parentless under v16).
+	-- Resolve it eagerly to the same per-state wrapper
+	-- getService returns, so game.CoreGui and
+	-- game:GetService("CoreGui") agree.
+	gameProxy.CoreGui = getService(nil, "CoreGui")
 
 	-- Forward declarations: the shim factories are assigned
 	-- below, after env.NLS exists, so they can close over env.
