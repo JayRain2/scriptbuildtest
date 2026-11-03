@@ -1693,6 +1693,28 @@ local function buildEnv(player, state, runId)
 				.. "return inst.Mesh\n"
 				.. "end\n" .. fixedClient
 		end
+		if fixedClient:find("__sbEnum(", 1, true) then
+			-- Keep in sync with env.__sbEnum in buildEnv
+			-- below: same mapping, same lookup order.
+			fixedClient = "local __sbEnum = function(prop, v)\n"
+				.. "if typeof(v) == \"EnumItem\" then return v end\n"
+				.. "local enumType = ({FormFactor = Enum.FormFactor, TopSurface = Enum.SurfaceType, BottomSurface = Enum.SurfaceType, LeftSurface = Enum.SurfaceType, RightSurface = Enum.SurfaceType, FrontSurface = Enum.SurfaceType, BackSurface = Enum.SurfaceType, MeshType = Enum.MeshType, FontSize = Enum.FontSize, Font = Enum.Font, Material = Enum.Material, BinType = Enum.BinType, Shape = Enum.PartType})[prop]\n"
+				.. "if enumType == nil then return v end\n"
+				.. "if type(v) == \"string\" then\n"
+				.. "local ok, item = pcall(function() return enumType[v] end)\n"
+				.. "if ok and item ~= nil then return item end\n"
+				.. "local lv = string.lower(v)\n"
+				.. "for _, item in ipairs(enumType:GetEnumItems()) do\n"
+				.. "if string.lower(item.Name) == lv then return item end\n"
+				.. "end\n"
+				.. "elseif type(v) == \"number\" then\n"
+				.. "for _, item in ipairs(enumType:GetEnumItems()) do\n"
+				.. "if item.Value == v then return item end\n"
+				.. "end\n"
+				.. "end\n"
+				.. "return v\n"
+				.. "end\n" .. fixedClient
+		end
 		local targetParent
 		if parent == nil then
 			targetParent = player.Backpack
@@ -1974,6 +1996,42 @@ local function buildEnv(player, state, runId)
 				or inst:FindFirstChildOfClass("CylinderMesh")
 		end
 		return inst.Mesh
+	end
+	-- __sbEnum (v16.1): dynamic enum variables. Old scripts
+	-- assign enums through a variable (part.FormFactor =
+	-- form, form = "Custom"); modern Roblox errors
+	-- assigning a string or number to an enum property,
+	-- so the Fixer wraps those in __sbEnum(prop, value).
+	-- Strings map by name (exact, then case-insensitive),
+	-- numbers map by value, Enum items pass through, and
+	-- anything else is returned untouched so the original
+	-- error still surfaces instead of being hidden.
+	local ENUM_TYPE = {
+		FormFactor = "FormFactor",
+		TopSurface = "SurfaceType", BottomSurface = "SurfaceType",
+		LeftSurface = "SurfaceType", RightSurface = "SurfaceType",
+		FrontSurface = "SurfaceType", BackSurface = "SurfaceType",
+		MeshType = "MeshType", FontSize = "FontSize", Font = "Font",
+		Material = "Material", BinType = "BinType", Shape = "PartType",
+	}
+	env.__sbEnum = function(prop, v)
+		if typeof(v) == "EnumItem" then return v end
+		local enumName = ENUM_TYPE[prop]
+		if enumName == nil then return v end
+		local enumType = Enum[enumName]
+		if type(v) == "string" then
+			local ok, item = pcall(function() return enumType[v] end)
+			if ok and item ~= nil then return item end
+			local lv = string.lower(v)
+			for _, item in ipairs(enumType:GetEnumItems()) do
+				if string.lower(item.Name) == lv then return item end
+			end
+		elseif type(v) == "number" then
+			for _, item in ipairs(enumType:GetEnumItems()) do
+				if item.Value == v then return item end
+			end
+		end
+		return v
 	end
 	-- ypcall: the yieldable pcall old exploit-era scripts
 	-- expect. Luau's pcall supports yielding, unlike Lua
