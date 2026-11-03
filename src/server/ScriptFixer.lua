@@ -86,6 +86,7 @@ local REPLACEMENTS = {
 	{ ":findPartOnRay%(", ":FindPartOnRay(", "Old :findPartOnRay() -> :FindPartOnRay()" },
 	{ ":findPartOnRayWithIgnoreList%(", ":FindPartOnRayWithIgnoreList(", "Old :findPartOnRayWithIgnoreList() -> :FindPartOnRayWithIgnoreList()" },
 	{ "%.formFactor%f[^%w_]", ".FormFactor", "Old .formFactor -> .FormFactor" },
+	{ "%.force%f[^%w_]", ".Force", "Old .force -> .Force (BodyForce)" },
 	{ "%f[%w]wait%(", "task.wait(", "wait() -> task.wait()" },
 	{ "%f[%w]spawn%(", "task.spawn(", "spawn() -> task.spawn()" },
 	{ "%f[%w]delay%(", "task.delay(", "delay() -> task.delay()" },
@@ -933,6 +934,442 @@ local function wrapProxyAssignments(source)
 	return table.concat(out)
 end
 
+-- v16.1 passes. These share one code-only scanner (strings,
+-- comments and longstrings are copied verbatim, never
+-- rewritten) so a pattern inside a string or comment can
+-- never trigger a rewrite.
+
+-- Shared code-only scanner: at each code position, tryMatch
+-- (source, i, n) may return (startPos, endPos, replacement)
+-- for a rewrite covering source[startPos..endPos]; nil
+-- leaves the char alone. startPos may be BEFORE i (the
+-- limb/mesh passes capture a receiver that ends at i), so
+-- matches are collected first and spliced at the end --
+-- emitting while scanning would duplicate the receiver,
+-- which the scanner has already passed. Strings, comments
+-- and longstrings are never matched inside.
+local function scanCode(source, tryMatch)
+	local matches = {}
+	local i = 1
+	local n = #source
+	local state = "code"
+	local quote = nil
+	local longLevel = 0
+	while i <= n do
+		local c = source:sub(i, i)
+		local two = source:sub(i, i + 1)
+		if state == "code" then
+			if two == "--" then
+				local level = source:sub(i + 2):match("^%[(=*)%[")
+				if level ~= nil then
+					state = "blockcomment"
+					longLevel = #level
+					i = i + 4 + longLevel
+				else
+					state = "linecomment"
+					i = i + 2
+				end
+			elseif c == '"' or c == "'" then
+				state = "string"
+				quote = c
+				i = i + 1
+			elseif c == "[" then
+				local level = source:sub(i):match("^%[(=*)%[")
+				if level ~= nil then
+					state = "longstring"
+					longLevel = #level
+					i = i + 2 + longLevel
+				else
+					i = i + 1
+				end
+			else
+				local startPos, endPos, replacement = tryMatch(source, i, n)
+				if replacement ~= nil then
+					matches[#matches + 1] = { startPos, endPos, replacement }
+					i = endPos + 1
+				else
+					i = i + 1
+				end
+			end
+		elseif state == "string" then
+			if c == "\\" and i < n then
+				i = i + 2
+			elseif c == quote then
+				state = "code"
+				i = i + 1
+			else
+				i = i + 1
+			end
+		elseif state == "linecomment" then
+			if c == "\n" then state = "code" end
+			i = i + 1
+		else -- blockcomment or longstring
+			local closer = "]" .. string.rep("=", longLevel) .. "]"
+			if source:sub(i, i + #closer - 1) == closer then
+				i = i + #closer
+				state = "code"
+			else
+				i = i + 1
+			end
+		end
+	end
+	local out = {}
+	local pos = 1
+	for _, m in ipairs(matches) do
+		if m[1] > pos then out[#out + 1] = source:sub(pos, m[1] - 1) end
+		out[#out + 1] = m[3]
+		pos = m[2] + 1
+	end
+	if pos <= n then out[#out + 1] = source:sub(pos, n) end
+	return table.concat(out)
+end
+
+-- Capture the receiver expression ending just before `pos`
+-- (the index of the `:` or `.` starting a call or index).
+-- Returns the receiver text, or nil when it is not a simple
+-- value (keyword-led, unbalanced, or split across lines):
+-- those are left untouched rather than rewritten wrong.
+-- Method calls bind tighter than binary operators, so the
+-- receiver is the atom before the `:`/`.`, and operators,
+-- commas, semicolons and `=` are boundaries, not part of
+-- it. A `..` is also a boundary (the receiver is the value
+-- after it), because dots otherwise swallow the concat.
+local function captureReceiver(source, pos)
+	local j = pos - 1
+	if j < 1 then return nil end
+	local depth = 0
+	while j >= 1 do
+		local c = source:sub(j, j)
+		if c == ")" or c == "]" then
+			depth = depth + 1
+		elseif c == "(" or c == "[" then
+			depth = depth - 1
+			if depth < 0 then break end
+		elseif depth == 0 then
+			if c == "." and j > 1 and source:sub(j - 1, j - 1) == "." then
+				break
+			end
+			if c == " " or c == "\t" or c == "\n" or c == "\r"
+				or c == ";" or c == "," or c == "="
+				or c == "+" or c == "-" or c == "*" or c == "/"
+				or c == "%" or c == "^" or c == "#" or c == "<"
+				or c == ">" or c == "~" then
+				break
+			end
+		end
+		j = j - 1
+	end
+	local receiver = source:sub(j + 1, pos - 1):gsub("%s+$", "")
+	if receiver == "" then return nil end
+	if receiver:find("\n") then return nil end
+	if receiver:match("[%.:]$") then return nil end
+	-- Strip short strings (escapes handled) and same-line
+	-- longstrings, then the receiver must be balanced and
+	-- free of top-level operators and keywords.
+	local stripped = receiver:gsub("\\.", "")
+	stripped = stripped:gsub('"[^"\n]*"', '""'):gsub("'[^'\n]*'", "''")
+	stripped = stripped:gsub("%[%[.-%]%]", "")
+	local bal = 0
+	for k = 1, #stripped do
+		local c = stripped:sub(k, k)
+		if c == "(" or c == "[" then
+			bal = bal + 1
+		elseif c == ")" or c == "]" then
+			bal = bal - 1
+			if bal < 0 then return nil end
+		end
+	end
+	if bal ~= 0 then return nil end
+	local flat = stripped:gsub("%b()", ""):gsub("%b[]", "")
+	if flat:find("%.%.") then return nil end
+	if flat:find("[%+%-%*/%%^#<>~=]") then return nil end
+	if flat:find("%f[%w]and%f[^%w]") or flat:find("%f[%w]or%f[^%w]")
+		or flat:find("%f[%w]not%f[^%w]") then return nil end
+	-- Leading keyword (return(x):... style) means the scan
+	-- swallowed a statement keyword: leave it alone.
+	local firstWord = receiver:match("^(%a+)")
+	if firstWord == "return" or firstWord == "local" or firstWord == "if"
+		or firstWord == "then" or firstWord == "else" or firstWord == "elseif"
+		or firstWord == "while" or firstWord == "for" or firstWord == "do"
+		or firstWord == "and" or firstWord == "or" or firstWord == "not"
+		or firstWord == "function" or firstWord == "repeat" or firstWord == "until"
+		or firstWord == "in" or firstWord == "break" then
+		return nil
+	end
+	return receiver, j + 1
+end
+
+-- Find the ")" closing the call opened at `openPos`,
+-- skipping strings, comments and longstrings.
+local function findCloseParen(src, openPos, n)
+	local depth = 1
+	local m = openPos + 1
+	local state = "code"
+	local quote = nil
+	local longLevel = 0
+	while m <= n do
+		local c = src:sub(m, m)
+		local two = src:sub(m, m + 1)
+		if state == "code" then
+			if two == "--" then
+				local level = src:sub(m + 2):match("^%[(=*)%[")
+				if level ~= nil then
+					state = "blockcomment"
+					longLevel = #level
+					m = m + 4 + longLevel
+				else
+					state = "linecomment"
+					m = m + 2
+				end
+			elseif c == '"' or c == "'" then
+				state = "string"
+				quote = c
+				m = m + 1
+			elseif c == "[" then
+				local level = src:sub(m):match("^%[(=*)%[")
+				if level ~= nil then
+					state = "longstring"
+					longLevel = #level
+					m = m + 2 + longLevel
+				else
+					m = m + 1
+				end
+			elseif c == "(" then
+				depth = depth + 1
+				m = m + 1
+			elseif c == ")" then
+				depth = depth - 1
+				if depth == 0 then return m end
+				m = m + 1
+			else
+				m = m + 1
+			end
+		elseif state == "string" then
+			if c == "\\" then m = m + 2
+			elseif c == quote then state = "code"; m = m + 1
+			else m = m + 1 end
+		elseif state == "linecomment" then
+			if c == "\n" then state = "code" end
+			m = m + 1
+		else -- blockcomment or longstring
+			local closer = "]" .. string.rep("=", longLevel) .. "]"
+			if src:sub(m, m + #closer - 1) == closer then
+				state = "code"
+				m = m + #closer
+			else
+				m = m + 1
+			end
+		end
+	end
+	return nil
+end
+
+-- Method spellings that can also be called with a string
+-- literal and no parens (:findFirstChild'Torso'), which the
+-- REPLACEMENTS paren patterns miss. Built from REPLACEMENTS
+-- so the two stay in sync: lowercase method name ->
+-- canonical ":Name" (the pass adds the paren back).
+local METHOD_STRINGCALL = {}
+for _, r in ipairs(REPLACEMENTS) do
+	if r[1]:sub(1, 1) == ":" and r[1]:sub(-2) == "%(" then
+		METHOD_STRINGCALL[r[1]:sub(2, -3):lower()] = r[2]:sub(1, -2)
+	end
+end
+
+-- :method'STR' / :method"STR" -> :Method('STR') / :Method("STR").
+-- Without this, :findFirstChild'Torso' reaches a real
+-- Instance untouched and dies on the lowercase spelling.
+local function fixStringCallMethods(source)
+	return scanCode(source, function(src, i, n)
+		if src:sub(i, i) ~= ":" then return nil end
+		local name = src:match("^[A-Za-z]+", i + 1)
+		if name == nil then return nil end
+		local canon = METHOD_STRINGCALL[name:lower()]
+		if canon == nil then return nil end
+		local j = i + 1 + #name
+		while src:sub(j, j) == " " or src:sub(j, j) == "\t" do j = j + 1 end
+		local q = src:sub(j, j)
+		if q ~= '"' and q ~= "'" then return nil end
+		local k = j + 1
+		while k <= n do
+			local ch = src:sub(k, k)
+			if ch == "\\" then k = k + 2
+			elseif ch == q then break
+			elseif ch == "\n" then break
+			else k = k + 1 end
+		end
+		if src:sub(k, k) ~= q then return nil end
+		return i, k, canon .. "(" .. src:sub(j, k) .. ")"
+	end)
+end
+
+-- R6 limb names that also need an R15 fallback when the
+-- lookup runs on a REAL model (another player's character,
+-- where the R6 character proxy does not apply).
+local LIMB_NAMES = {
+	Torso = true,
+	["Left Arm"] = true,
+	["Right Arm"] = true,
+	["Left Leg"] = true,
+	["Right Leg"] = true,
+}
+
+-- X:FindFirstChild("Torso"[, recursive]) ->
+-- __sbFindLimb(X, "Torso"[, recursive]). The literal name
+-- is tried first inside the helper, so R6 characters are
+-- unchanged and R15 characters resolve to UpperTorso etc.
+local function fixLimbLookups(source)
+	return scanCode(source, function(src, i, n)
+		if src:sub(i, i) ~= ":" then return nil end
+		if src:sub(i, i + 14) ~= ":FindFirstChild" then return nil end
+		local j = i + 15
+		while src:sub(j, j) == " " or src:sub(j, j) == "\t" do j = j + 1 end
+		if src:sub(j, j) ~= "(" then return nil end
+		local openParen = j
+		j = j + 1
+		while src:sub(j, j) == " " or src:sub(j, j) == "\t" do j = j + 1 end
+		local q = src:sub(j, j)
+		if q ~= '"' and q ~= "'" then return nil end
+		local k = j + 1
+		local name = nil
+		while k <= n do
+			local ch = src:sub(k, k)
+			if ch == "\\" then k = k + 2
+			elseif ch == q then name = src:sub(j + 1, k - 1); break
+			elseif ch == "\n" then break
+			else k = k + 1 end
+		end
+		if name == nil or not LIMB_NAMES[name] then return nil end
+		local closePos = findCloseParen(src, openParen, n)
+		if closePos == nil then return nil end
+		local receiver, recvStart = captureReceiver(src, i)
+		if receiver == nil then return nil end
+		local rest = src:sub(k + 1, closePos - 1)
+		return recvStart, closePos, "__sbFindLimb(" .. receiver .. ", " .. src:sub(j, k) .. rest .. ")"
+	end)
+end
+
+-- X.Mesh (old child-dot access) -> __sbMesh(X). No Instance
+-- has a Mesh property, so a dotted .Mesh is always a child
+-- lookup in old scripts; writes (X.Mesh = ...) are left
+-- alone because a call result cannot be assigned to.
+local function fixMeshAccess(source)
+	return scanCode(source, function(src, i, n)
+		if src:sub(i, i) ~= "." then return nil end
+		if src:sub(i, i + 4) ~= ".Mesh" then return nil end
+		if src:sub(i + 5, i + 5):match("[%w_]") then return nil end
+		local j = i + 5
+		while src:sub(j, j) == " " or src:sub(j, j) == "\t" do j = j + 1 end
+		if src:sub(j, j) == "=" and src:sub(j + 1, j + 1) ~= "=" then return nil end
+		local receiver, recvStart = captureReceiver(src, i)
+		if receiver == nil then return nil end
+		return recvStart, i + 4, "__sbMesh(" .. receiver .. ")"
+	end)
+end
+
+-- Enum-typed properties assigned a literal in old scripts.
+-- Modern Luau requires an EnumItem there: a number or a
+-- string errors. numbers lists the value for 0, 1, 2, ...
+-- (only for properties old scripts actually set by number);
+-- names lists the valid string spellings. Anything else
+-- (an expression, an unknown string, an out-of-range
+-- number) is left alone.
+local SURFACE_NAMES = {
+	Smooth = true, Glue = true, Weld = true, Studs = true,
+	Inlet = true, Universal = true, Hinge = true, Motor = true,
+	SteppingMotor = true, SmoothNoOutlines = true,
+}
+local SURFACE_NUMBERS = {
+	"Smooth", "Glue", "Weld", "Studs", "Inlet",
+	"Universal", "Hinge", "Motor", "SteppingMotor",
+}
+local ENUM_PROPS = {
+	TopSurface = { enum = "SurfaceType", names = SURFACE_NAMES, numbers = SURFACE_NUMBERS },
+	BottomSurface = { enum = "SurfaceType", names = SURFACE_NAMES, numbers = SURFACE_NUMBERS },
+	LeftSurface = { enum = "SurfaceType", names = SURFACE_NAMES, numbers = SURFACE_NUMBERS },
+	RightSurface = { enum = "SurfaceType", names = SURFACE_NAMES, numbers = SURFACE_NUMBERS },
+	FrontSurface = { enum = "SurfaceType", names = SURFACE_NAMES, numbers = SURFACE_NUMBERS },
+	BackSurface = { enum = "SurfaceType", names = SURFACE_NAMES, numbers = SURFACE_NUMBERS },
+	FormFactor = { enum = "FormFactor",
+		names = { Symmetric = true, Brick = true, Plate = true, Custom = true },
+		numbers = { "Symmetric", "Brick", "Plate", "Custom" } },
+	MeshType = { enum = "MeshType",
+		names = { Head = true, Torso = true, Wedge = true, Sphere = true,
+			Cylinder = true, FileMesh = true, Brick = true, Prism = true,
+			Pyramid = true, ParallelRamp = true, RightAngleRamp = true,
+			CornerWedge = true } },
+	FontSize = { enum = "FontSize",
+		names = { Size8 = true, Size9 = true, Size10 = true, Size11 = true,
+			Size12 = true, Size14 = true, Size18 = true, Size24 = true,
+			Size28 = true, Size32 = true, Size36 = true, Size48 = true,
+			Size60 = true, Size96 = true } },
+	Font = { enum = "Font",
+		names = { Legacy = true, Arial = true, ArialBold = true,
+			SourceSans = true, SourceSansBold = true, SourceSansSemibold = true,
+			SourceSansLight = true, SourceSansItalic = true, Gotham = true,
+			GothamBold = true, GothamSemibold = true, GothamMedium = true,
+			GothamBlack = true, Code = true, Cartoon = true, Fantasy = true } },
+	Material = { enum = "Material",
+		names = { Plastic = true, SmoothPlastic = true, Neon = true,
+			Wood = true, WoodPlanks = true, Marble = true, Slate = true,
+			Concrete = true, Metal = true, DiamondPlate = true, Foil = true,
+			Grass = true, Ice = true, Glass = true, Granite = true,
+			Brick = true, Cobblestone = true, Rock = true, Sand = true,
+			Snow = true, Cardboard = true, Clay = true } },
+	BinType = { enum = "BinType",
+		names = { Script = true, GameTool = true, Grab = true,
+			Clone = true, Hammer = true },
+		numbers = { "Script", "GameTool", "Grab", "Clone", "Hammer" } },
+	Shape = { enum = "PartType",
+		names = { Ball = true, Block = true, Cylinder = true } },
+}
+
+local function fixEnumLiterals(source)
+	return scanCode(source, function(src, i, n)
+		if src:sub(i, i) ~= "." then return nil end
+		local prop = src:match("^([A-Z][%w_]*)", i + 1)
+		if prop == nil then return nil end
+		local spec = ENUM_PROPS[prop]
+		if spec == nil then return nil end
+		local j = i + 1 + #prop
+		if src:sub(j, j):match("[%w_]") then return nil end
+		while src:sub(j, j) == " " or src:sub(j, j) == "\t" do j = j + 1 end
+		if src:sub(j, j) ~= "=" then return nil end
+		if src:sub(j + 1, j + 1) == "=" then return nil end
+		j = j + 1
+		while src:sub(j, j) == " " or src:sub(j, j) == "\t" do j = j + 1 end
+		local ch = src:sub(j, j)
+		local enumName = nil
+		local nextI = nil
+		if ch == '"' or ch == "'" then
+			local k = j + 1
+			while k <= n do
+				local c2 = src:sub(k, k)
+				if c2 == "\\" then k = k + 2
+				elseif c2 == ch then break
+				elseif c2 == "\n" then break
+				else k = k + 1 end
+			end
+			if src:sub(k, k) ~= ch then return nil end
+			local val = src:sub(j + 1, k - 1)
+			if not spec.names[val] then return nil end
+			enumName = val
+			nextI = k + 1
+		elseif ch:match("%d") then
+			local numStr = src:match("^(%d+)", j)
+			if numStr == nil then return nil end
+			if src:sub(j + #numStr, j + #numStr):match("[%w_%.]") then return nil end
+			if spec.numbers == nil then return nil end
+			enumName = spec.numbers[tonumber(numStr) + 1]
+			if enumName == nil then return nil end
+			nextI = j + #numStr
+		else
+			return nil
+		end
+		return i, nextI - 1, "." .. prop .. " = Enum." .. spec.enum .. "." .. enumName
+	end)
+end
+
 function Fixer.fix(source)
 	local notes = {}
 	local fixed = source
@@ -945,6 +1382,30 @@ function Fixer.fix(source)
 		end
 	end
 
+	-- v16.1 passes (order matters: string-call first so the
+	-- limb pass sees paren form; limb/mesh/enum before the
+	-- proxy unwrap so it wraps their final right-hand sides).
+	local rewritten = fixStringCallMethods(fixed)
+	if rewritten ~= fixed then
+		fixed = rewritten
+		notes[#notes + 1] = "Old string-call methods (:findFirstChild'Torso') -> paren form."
+	end
+	rewritten = fixLimbLookups(fixed)
+	if rewritten ~= fixed then
+		fixed = rewritten
+		notes[#notes + 1] = "R6 limb lookups (:FindFirstChild(\"Torso\") etc.) -> __sbFindLimb, so they also find the R15 part."
+	end
+	rewritten = fixMeshAccess(fixed)
+	if rewritten ~= fixed then
+		fixed = rewritten
+		notes[#notes + 1] = "Old child-dot access (.Mesh) -> __sbMesh."
+	end
+	rewritten = fixEnumLiterals(fixed)
+	if rewritten ~= fixed then
+		fixed = rewritten
+		notes[#notes + 1] = "Old enum literals (.TopSurface = 0, .MeshType = \"Wedge\", .FontSize = \"Size12\") -> Enum items."
+	end
+
 	local wrapped = wrapProxyAssignments(fixed)
 	if wrapped ~= fixed then
 		fixed = wrapped
@@ -953,7 +1414,7 @@ function Fixer.fix(source)
 
 	-- Hard blocks, reported as notes (the sandbox enforces them too).
 	if fixed:find("Instance%.new%(%s*[\"']Script[\"']") or fixed:find("Instance%.new%(%s*[\"']LocalScript[\"']") then
-		notes[#notes + 1] = "Creating Script/LocalScript objects with Instance.new is blocked by the sandbox; use NLS(source, parent) for client code."
+		notes[#notes + 1] = "Creating Script/LocalScript objects with Instance.new runs them through the sandbox (server Scripts in a fresh sandbox env, LocalScripts through NLS) once Source and Parent are both set."
 	end
 	notes[#notes + 1] = "Runs on the server through vLuau (a real Luau compiler + VM), not the client: every Part/Model it creates replicates normally under FilteringEnabled."
 	notes[#notes + 1] = "script.Parent points at your per-player build folder. game.Players.LocalPlayer is the player who pressed Execute."
@@ -980,6 +1441,30 @@ function Fixer.fixClientSource(source)
 				notes[#notes + 1] = r[3]
 			end
 		end
+	end
+
+	-- v16.1 passes (same as the server pass, minus the proxy
+	-- unwrap: the client has no __sbUnwrap, and NLS defines
+	-- __sbFindLimb/__sbMesh at the top when they are used).
+	local rewritten = fixStringCallMethods(fixed)
+	if rewritten ~= fixed then
+		fixed = rewritten
+		notes[#notes + 1] = "Old string-call methods (:findFirstChild'Torso') -> paren form."
+	end
+	rewritten = fixLimbLookups(fixed)
+	if rewritten ~= fixed then
+		fixed = rewritten
+		notes[#notes + 1] = "R6 limb lookups (:FindFirstChild(\"Torso\") etc.) -> __sbFindLimb, so they also find the R15 part."
+	end
+	rewritten = fixMeshAccess(fixed)
+	if rewritten ~= fixed then
+		fixed = rewritten
+		notes[#notes + 1] = "Old child-dot access (.Mesh) -> __sbMesh."
+	end
+	rewritten = fixEnumLiterals(fixed)
+	if rewritten ~= fixed then
+		fixed = rewritten
+		notes[#notes + 1] = "Old enum literals (.TopSurface = 0, .MeshType = \"Wedge\", .FontSize = \"Size12\") -> Enum items."
 	end
 
 	return fixed, notes
