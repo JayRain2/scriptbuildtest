@@ -164,6 +164,11 @@ local function clearPlayerBuilds(player)
 	-- placeholders are rebuilt fresh on the next run.
 	state.sharedTables = nil
 	state.servicePlaceholders = nil
+	-- v16.1: bin relays point at BindableEvents destroyed
+	-- above, so drop them too; a stale relay must never
+	-- fire select() after Clear.
+	state.binRelays = nil
+	state.binRelayLast = nil
 	if state.folder then
 		for _, child in ipairs(state.folder:GetChildren()) do
 			pcall(function() child:Destroy() end)
@@ -210,7 +215,11 @@ local function ensureInputRemote(player)
 		-- is spoofing, not input, and is dropped.
 		if sender.UserId ~= player.UserId then return end
 		local state = getState(sender)
-		Sandbox.applyMouseInput(state, packet)
+		if type(packet) == "table" and packet.type == "bin" then
+			Sandbox.applyBinInput(state, packet)
+		else
+			Sandbox.applyMouseInput(state, packet)
+		end
 	end)
 	return remote
 end
