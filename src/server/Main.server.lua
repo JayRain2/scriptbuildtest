@@ -119,6 +119,7 @@ local function getState(player)
 			lastExecute = 0,
 			uploads = {},
 			runId = 0,
+			player = player,
 		}
 		playersState[player.UserId] = state
 	end
@@ -159,6 +160,10 @@ local function clearPlayerBuilds(player)
 	state.scriptChildren = {}
 	state.charProxies = nil
 	state.proxyReal = nil
+	-- v16 sandbox state: _G/shared tables and service
+	-- placeholders are rebuilt fresh on the next run.
+	state.sharedTables = nil
+	state.servicePlaceholders = nil
 	if state.folder then
 		for _, child in ipairs(state.folder:GetChildren()) do
 			pcall(function() child:Destroy() end)
