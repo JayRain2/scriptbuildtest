@@ -158,6 +158,36 @@ end
 -- UI
 --------------------------------------------------------------------------------
 
+-- Exactly one builder GUI (v16.1): this LocalScript lives in
+-- StarterGui, so it re-runs on every respawn, while the GUI
+-- itself survives respawn (ResetOnSpawn = false below).
+-- Without this cleanup each death stacked another full
+-- window (and another Open Builder button). The old
+-- window's editor text and open/closed state are captured
+-- first, so the replacement keeps what the player was
+-- doing; with several stale windows (from before this fix)
+-- the first one's state wins.
+local savedText = nil
+local savedMainVisible = nil
+local savedMiniVisible = nil
+local capturedOld = false
+for _, existing in ipairs(playerGui:GetChildren()) do
+	if existing:IsA("ScreenGui") and existing.Name == "ScriptBuilderGui" then
+		if not capturedOld then
+			capturedOld = true
+			local oldMain = existing:FindFirstChild("Main", true)
+			if oldMain then
+				savedMainVisible = oldMain.Visible
+				local oldCode = oldMain:FindFirstChild("CodeBox", true)
+				if oldCode then savedText = oldCode.Text end
+			end
+			local oldMini = existing:FindFirstChild("OpenBuilder", true)
+			if oldMini then savedMiniVisible = oldMini.Visible end
+		end
+		existing:Destroy()
+	end
+end
+
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "ScriptBuilderGui"
 screenGui.ResetOnSpawn = false
@@ -547,6 +577,20 @@ end
 
 loadSource(codeBox.Text)
 
+-- v16.1 respawn restore: the guard above destroyed the old
+-- window, so put its editor text and open/closed state back.
+-- loadSource re-splits into pages, so the restored text
+-- survives page switches too.
+if savedText ~= nil then
+	loadSource(savedText)
+end
+if savedMainVisible ~= nil then
+	main.Visible = savedMainVisible
+	if savedMiniVisible ~= nil then
+		miniButton.Visible = savedMiniVisible
+	end
+end
+
 --------------------------------------------------------------------------------
 -- Buttons / server replies
 --------------------------------------------------------------------------------
@@ -810,4 +854,53 @@ UserInputService.InputChanged:Connect(function(input, gameProcessed)
 			inputRemote:FireServer({ type = "wheelBackward" })
 		end
 	end
+end)
+
+--------------------------------------------------------------------------------
+-- HopperBin selection forwarding (v16.1)
+--------------------------------------------------------------------------------
+-- Bin tools run on the server in the builder, but a bin's
+-- Selected/Deselected only fires reliably on the client, so
+-- the client forwards it: every HopperBin the builder made
+-- (marked with an SB_BinId attribute) gets its local
+-- Selected/Deselected connected, and each equip/unequip
+-- sends one packet down the same Input remote. The server
+-- fires the script's select() with the emulated mouse. Bins
+-- without the attribute (game bins, not builder bins) are
+-- left alone. Forwarding runs whether the builder window is
+-- open or closed, like the mouse/key forwarding above.
+
+task.spawn(function()
+	local backpack = player:WaitForChild("Backpack")
+	local binConnections = {}
+	local function watchBin(bin)
+		if not bin:IsA("HopperBin") then return end
+		if binConnections[bin] ~= nil then return end
+		local binId = bin:GetAttribute("SB_BinId")
+		if binId == nil then return end
+		local selConn = bin.Selected:Connect(function()
+			if inputRemote then
+				inputRemote:FireServer({ type = "bin", binId = binId, action = "selected" })
+			end
+		end)
+		local deselConn = bin.Deselected:Connect(function()
+			if inputRemote then
+				inputRemote:FireServer({ type = "bin", binId = binId, action = "deselected" })
+			end
+		end)
+		binConnections[bin] = { selConn, deselConn }
+	end
+	for _, child in ipairs(backpack:GetChildren()) do
+		watchBin(child)
+	end
+	backpack.ChildAdded:Connect(watchBin)
+	backpack.ChildRemoved:Connect(function(bin)
+		local conns = binConnections[bin]
+		if conns then
+			for _, c in ipairs(conns) do
+				pcall(function() c:Disconnect() end)
+			end
+			binConnections[bin] = nil
+		end
+	end)
 end)
