@@ -1,5 +1,5 @@
 {
-  "version": 1793728774,
+  "version": 1793729586,
   "files": [
     {
       "path": "src/server/Main.server.lua",
@@ -8,13 +8,13 @@
     },
     {
       "path": "src/server/ScriptFixer.lua",
-      "sha256": "8b27876036bfa11f02728045a26f98d4020908b84ed5e319a74272d14f84403d",
-      "size": 52330
+      "sha256": "19ec9fc8a0896b7fdcd94f3b66afd441d572faa60c3337ade8dae59e00b187af",
+      "size": 54490
     },
     {
       "path": "src/server/Sandbox.lua",
-      "sha256": "8dc9d61730c43b410693a8488e3f4a2abf8a510e543dd88bcd0509f6e30b5186",
-      "size": 82635
+      "sha256": "a73d9c8c210b77c41dbbef45be1e0c84b353a12af722c869d6e8ac45374c4353",
+      "size": 85419
     },
     {
       "path": "src/server/ScriptBuilderShared.lua",
