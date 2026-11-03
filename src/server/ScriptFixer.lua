@@ -1370,6 +1370,39 @@ local function fixEnumLiterals(source)
 	end)
 end
 
+-- Dynamic enum variables (v16.1 follow-up): old scripts
+-- pass an enum as a VARIABLE -- Grab_Knife's prop() does
+-- part.FormFactor = form, where callers pass "Custom".
+-- The literal pass cannot rewrite that (there is no
+-- literal), and modern Roblox errors assigning a string
+-- or number to an enum property, so the variable goes
+-- through __sbEnum, which maps strings (exact, then
+-- case-insensitive) and numbers to the real Enum item and
+-- passes Enum items straight through. Only a bare
+-- identifier is wrapped: calls, field access, indexing
+-- and operators are left alone, because a complex
+-- expression cannot be safely split at its first term.
+local function fixDynamicEnumProps(source)
+	return scanCode(source, function(src, i, n)
+		if src:sub(i, i) ~= "." then return nil end
+		local prop = src:match("^%.([A-Za-z]+)", i)
+		if prop == nil or ENUM_PROPS[prop] == nil then return nil end
+		local j = i + 1 + #prop
+		while src:sub(j, j) == " " or src:sub(j, j) == "\t" do j = j + 1 end
+		if src:sub(j, j) ~= "=" or src:sub(j + 1, j + 1) == "=" then return nil end
+		local k = j + 1
+		while src:sub(k, k) == " " or src:sub(k, k) == "\t" do k = k + 1 end
+		local ident = src:match("^([A-Za-z_][%w_]*)", k)
+		if ident == nil then return nil end
+		local m = k + #ident
+		while src:sub(m, m) == " " or src:sub(m, m) == "\t" do m = m + 1 end
+		local c = src:sub(m, m)
+		if c == "." or c == ":" or c == "(" or c == "[" then return nil end
+		if c == "+" or c == "-" or c == "*" or c == "/" or c == "%" or c == "^" or c == "#" or c == "<" or c == ">" or c == "=" or c == "~" then return nil end
+		return i, k + #ident - 1, "." .. prop .. " = __sbEnum(\"" .. prop .. "\", " .. ident .. ")"
+	end)
+end
+
 function Fixer.fix(source)
 	local notes = {}
 	local fixed = source
@@ -1404,6 +1437,11 @@ function Fixer.fix(source)
 	if rewritten ~= fixed then
 		fixed = rewritten
 		notes[#notes + 1] = "Old enum literals (.TopSurface = 0, .MeshType = \"Wedge\", .FontSize = \"Size12\") -> Enum items."
+	end
+	rewritten = fixDynamicEnumProps(fixed)
+	if rewritten ~= fixed then
+		fixed = rewritten
+		notes[#notes + 1] = "Dynamic enum variables (.FormFactor = form) -> __sbEnum, which maps the string/number to the real Enum item."
 	end
 
 	local wrapped = wrapProxyAssignments(fixed)
@@ -1465,6 +1503,11 @@ function Fixer.fixClientSource(source)
 	if rewritten ~= fixed then
 		fixed = rewritten
 		notes[#notes + 1] = "Old enum literals (.TopSurface = 0, .MeshType = \"Wedge\", .FontSize = \"Size12\") -> Enum items."
+	end
+	rewritten = fixDynamicEnumProps(fixed)
+	if rewritten ~= fixed then
+		fixed = rewritten
+		notes[#notes + 1] = "Dynamic enum variables (.FormFactor = form) -> __sbEnum, which maps the string/number to the real Enum item."
 	end
 
 	return fixed, notes
